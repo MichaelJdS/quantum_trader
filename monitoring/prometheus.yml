@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "quantum_trader"
+    static_configs:
+      - targets: ["quantum_trader:8001"]
