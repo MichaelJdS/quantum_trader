@@ -1,13 +1,9 @@
 global:
-  scrape_interval: 5s      # Ideal para monitorar HFT sem derrubar a CPU
-  evaluation_interval: 5s
+  scrape_interval: 1s # HFT exige coleta a cada 1 segundo
+  evaluation_interval: 1s
 
 scrape_configs:
-  - job_name: 'quantum_trader'
-    metrics_path: '/metrics'
+  - job_name: 'quantum_bot'
     static_configs:
-      - targets: ['localhost:8000'] # Aponta para o servidor de métricas interno do seu bot
-
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
+      # O host.docker.internal é a ponte mágica que faz o Docker enxergar o seu Windows
+      - targets: ['host.docker.internal:8000']
