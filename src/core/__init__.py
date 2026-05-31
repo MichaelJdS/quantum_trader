@@ -1,11 +1,6 @@
-from .deriv_ws import DerivWebsocket
-from .consensus import ConsensusEngine
-from .risk_manager import RiskManager
-from .orchestrator import QuantumTraderOrchestrator
+# src/core/__init__.py
 
-__all__ = [
-    "DerivWebsocket",
-    "ConsensusEngine",
-    "RiskManager",
-    "QuantumTraderOrchestrator"
-]
+from .orchestrator import DerivOrchestrator
+from .risk_manager import KellyRiskManager
+
+__all__ = ['DerivOrchestrator', 'KellyRiskManager']

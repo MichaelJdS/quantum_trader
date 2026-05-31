@@ -1,35 +1,61 @@
 {
-  "dashboard": {
-    "id": null,
-    "uid": "quantum-trader-v3",
-    "title": "QuantumTrader Core v3.0",
-    "timezone": "browser",
-    "panels": [
-      {
-        "id": 1, "title": "PNL & Balance", "type": "timeseries",
-        "targets": [{"expr": "deriv_balance{job=\"quantum\"}", "legendFormat": "Balance"}],
-        "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}}}
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "unit": "currencyUSD" },
+        "overrides": []
       },
-      {
-        "id": 2, "title": "Drawdown %", "type": "gauge",
-        "targets": [{"expr": "deriv_drawdown{job=\"quantum\"}"}],
-        "options": {"thresholds": [{"value": 3, "color": "#f029-97"}]}
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "pluginVersion": "10.0.3",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "quantum_current_balance", "instant": false, "legendFormat": "Capital Atual", "range": true, "refId": "A" } ],
+      "title": "Evolução do Capital (PnL)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "max": 1, "min": 0, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 0.5 }, { "color": "green", "value": 0.55 } ] }, "unit": "percentunit" },
+        "overrides": []
       },
-      {
-        "id": 3, "title": "Signal Distribution", "type": "piechart",
-        "targets": [{"expr": "count by (signal) (deriv_signals_total{job=\"quantum\"})"}]
+      "gridPos": { "h": 9, "w": 6, "x": 12, "y": 0 },
+      "id": 2,
+      "options": { "minVizHeight": 10, "minVizWidth": 0, "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "pluginVersion": "10.0.3",
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "quantum_ai_confidence", "instant": false, "legendFormat": "Confiança", "range": true, "refId": "A" } ],
+      "title": "Confiança Preditiva da IA",
+      "type": "gauge"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Segundos", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "auto", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.5 } ] }, "unit": "s" },
+        "overrides": []
       },
-      {
-        "id": 4, "title": "Agent Confidence Heatmap", "type": "heatmap",
-        "targets": [{"expr": "avg by (agent) (deriv_agent_confidence{job=\"quantum\"})"}]
-      },
-      {
-        "id": 5, "title": "System Status", "type": "stat",
-        "targets": [{"expr": "up{job=\"quantum\"}"}],
-        "options": {"colorMode": "background"}
-      }
-    ],
-    "time": {"from": "now-1h", "to": "now"},
-    "refresh": "5s"
-  }
+      "gridPos": { "h": 8, "w": 18, "x": 0, "y": 9 },
+      "id": 3,
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "prometheus" }, "editorMode": "code", "expr": "rate(quantum_ws_latency_seconds_sum[1m]) / rate(quantum_ws_latency_seconds_count[1m])", "legendFormat": "Latência Média", "range": true, "refId": "A" } ],
+      "title": "Latência HFT WebSocket (Deriv -> VPS)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["hft", "trading", "ai"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Quantum Trader - Institucional",
+  "uid": "quantum_hft_dash",
+  "version": 1
 }

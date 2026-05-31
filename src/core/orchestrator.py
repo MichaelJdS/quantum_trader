@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import time
 import websockets
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ import torch
 import joblib
 from collections import deque
 from typing import Optional
+from prometheus_client import Gauge, Counter, Histogram
 
 # Importando os motores matemáticos da nossa infraestrutura
 from src.models.lstm_predictor import MarketLSTM
@@ -21,10 +23,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DerivOrchestrator")
 
+# ================== SENSORES DE TELEMETRIA HFT ==================
+CURRENT_BALANCE = Gauge('quantum_current_balance', 'Saldo atual da conta em USD')
+AI_CONFIDENCE = Gauge('quantum_ai_confidence', 'Confiança da IA na última predição (%)')
+WS_LATENCY = Histogram('quantum_ws_latency_seconds', 'Latência do servidor Deriv até a VPS')
+TRADE_RESULT = Counter('quantum_trades_total', 'Total de trades processados', ['result'])
+# ================================================================
+
 class DerivOrchestrator:
     """
     Motor de Execução HFT Definitivo para a corretora Deriv.
-    Gestão de Risco GARCH(1,1) + IA Preditiva + Execução de Contratos Real-time.
+    Gestão de Risco GARCH(1,1) + IA Preditiva + Execução de Contratos Real-time + Telemetria Institucional.
     """
     def __init__(self, app_id: str, api_token: str, symbol: str = "R_100"):
         self.app_id = app_id
@@ -36,7 +45,7 @@ class DerivOrchestrator:
         self.device = torch.device("cpu")
         self.scaler = None
         
-        # Banca inicial base de configuração do Kelly (Será sincronizada via API posteriormente)
+        # Banca inicial base de configuração do Kelly (Sincronizada ao vivo na conexão)
         self.risk_manager = KellyRiskManager(initial_bankroll=1000.0, kelly_fraction=0.25, max_daily_drawdown=0.05)
         self.tick_buffer = deque(maxlen=250)
         
@@ -123,6 +132,9 @@ class DerivOrchestrator:
         max_prob = prob_call if is_call else prob_put
         direction_str = "CALL 🟢" if is_call else "PUT 🔴"
 
+        # INJEÇÃO DE TELEMETRIA: Atualiza a confiança da IA no Grafana
+        AI_CONFIDENCE.set(max_prob)
+
         # O Gestor de Risco (GARCH + Kelly) decide o tamanho da estaca com base na confiança
         stake = self.risk_manager.calculate_stake(max_prob, current_price, 0.95)
 
@@ -166,7 +178,7 @@ class DerivOrchestrator:
         """Loop de Sustentação Resiliente HFT."""
         logger.info(f"🌐 Iniciando Motor HFT na Deriv (Ativo: {self.symbol})...")
         
-        # Loop Externo de Reconexão (Se a internet da VPS piscar, o bot reinicia sozinho)
+        # Loop Externo de Reconexão Automática
         while True:
             try:
                 async with websockets.connect(self.ws_url, ping_interval=30) as websocket:
@@ -199,10 +211,19 @@ class DerivOrchestrator:
                             # Sincroniza a banca do bot com o saldo real lido na conta!
                             self.risk_manager.current_bankroll = float(data["authorize"]["balance"])
                             self.risk_manager.initial_bankroll = self.risk_manager.current_bankroll
+                            
+                            # INJEÇÃO DE TELEMETRIA: Saldo inicial
+                            CURRENT_BALANCE.set(self.risk_manager.current_bankroll)
                             logger.info(f"✅ Conexão Autorizada. Saldo Sincronizado: ${self.risk_manager.current_bankroll:.2f}")
 
                         elif msg_type == "tick":
                             current_price = float(data["tick"]["quote"])
+                            tick_epoch = int(data["tick"]["epoch"])
+                            
+                            # INJEÇÃO DE TELEMETRIA: Mede a latência da rede milissegundo a milissegundo
+                            latency = time.time() - tick_epoch
+                            WS_LATENCY.observe(latency)
+                            
                             self.tick_buffer.append(current_price)
                             
                             if len(self.tick_buffer) % 50 == 0:
@@ -217,7 +238,7 @@ class DerivOrchestrator:
                             ask_price = data["proposal"]["ask_price"]
                             
                             logger.info(f"✅ Proposta validada. Disparando compra a ${ask_price} (Zero-Latency)...")
-                            # Passo 2: Executa a compra imediatamente
+                            # Passo 2: Executa a compra imediatamente na corretora
                             buy_req = {"buy": proposal_id, "price": ask_price, "req_id": 101}
                             await self.ws.send(json.dumps(buy_req))
 
@@ -235,11 +256,14 @@ class DerivOrchestrator:
                             
                             if status == "won":
                                 logger.info(f"🏆 WIN! Operação encerrada com Lucro: +${profit:.2f}")
+                                TRADE_RESULT.labels(result='won').inc() # TELEMETRIA
                             else:
                                 logger.info(f"💀 LOSS. Operação encerrada com Prejuízo: -${abs(profit):.2f}")
+                                TRADE_RESULT.labels(result='loss').inc() # TELEMETRIA
                                 
                             # Atualiza o saldo e calibra o Risco e a Volatilidade GARCH para a próxima operação
                             self.risk_manager.update_bankroll(profit)
+                            CURRENT_BALANCE.set(self.risk_manager.current_bankroll) # TELEMETRIA
                             self.in_trade = False
 
             except websockets.exceptions.ConnectionClosed:

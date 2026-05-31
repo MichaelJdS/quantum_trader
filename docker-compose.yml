@@ -1,31 +1,4 @@
-version: '3.8'
-
-x-logging: &default-logging
-  driver: "json-file"
-  options:
-    max-size: "10m"
-    max-file: "3"
-
 services:
-  quantum_bot:
-    build: .
-    container_name: quantum_trader_core
-    restart: unless-stopped
-    network_mode: "host"  # Máxima performance de rede para o WebSocket HFT
-    volumes:
-      - ./data:/app/data
-      - ./models:/app/models
-      - ./quantum_trader.db:/app/quantum_trader.db
-    environment:
-      - TZ=America/Sao_Paulo
-      - ENV=production
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2G
-
   prometheus:
     image: prom/prometheus:latest
     container_name: quantum_prometheus
@@ -36,26 +9,17 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=15d' # Evita lotar o disco do VPS
     ports:
       - "9090:9090"
-    logging: *default-logging
 
   grafana:
     image: grafana/grafana-oss:latest
     container_name: quantum_grafana
     restart: unless-stopped
-    depends_on:
-      - prometheus
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana_dashboard.json:/var/lib/grafana/dashboards/quantum_dashboard.json:ro
     ports:
       - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin_quantum # Altere em produção
-      - GF_USERS_ALLOW_SIGN_UP=false
-    logging: *default-logging
+    volumes:
+      - grafana_data:/var/lib/grafana
 
 volumes:
   prometheus_data:
