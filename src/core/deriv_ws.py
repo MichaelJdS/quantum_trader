@@ -3,6 +3,8 @@ import json
 import websockets
 from typing import Callable, Dict, Any
 from loguru import logger
+from src.config import settings
+
 
 class DerivWS:
     def __init__(self, app_id: int = 1089, token: str = ""):
@@ -100,13 +102,17 @@ class DerivWS:
         return self._send({"balance": 1, "subscribe": 1})
 
     def execute_trade(self, direction: str, stake: float, symbol: str, duration: int):
-        logger.info(f"📤 Executando trade: {direction} | Stake: ${stake:.2f}")
+        logger.info(f"📤 Executando trade: {direction} | Stake: ${stake:.2f} | Duração: {duration}{settings.DURATION_UNIT}")
         return self._send({
             "buy": 1,
             "price": stake,
             "parameters": {
-                "amount": str(stake), "basis": "stake", "contract_type": direction,
-                "currency": "USD", "duration": duration, "duration_unit": "t",
+                "amount": str(stake), 
+                "basis": "stake", 
+                "contract_type": direction,
+                "currency": "USD", 
+                "duration": duration, 
+                "duration_unit": settings.DURATION_UNIT,  # Dinâmico baseado no config.py
                 "symbol": symbol
             }
         })
@@ -115,7 +121,9 @@ class DerivWS:
         self.connected = False
         if self._listen_task:
             self._listen_task.cancel()
-            try: await self._listen_task
-            except asyncio.CancelledError: pass
+            try: 
+                await self._listen_task
+            except asyncio.CancelledError: 
+                pass
         if self.ws:
             await self.ws.close()

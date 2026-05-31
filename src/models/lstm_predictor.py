@@ -3,10 +3,10 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 
+
 class MarketLSTM(nn.Module):
     def __init__(self, input_dim=5, hidden=64, layers=2, dropout=0.2):
         super().__init__()
-        # O PyTorch emite um aviso se o dropout for definido em LSTM de 1 camada.
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden,
@@ -21,30 +21,42 @@ class MarketLSTM(nn.Module):
         
     def forward(self, x):
         out, _ = self.lstm(x)
-        # Extrai apenas o último passo temporal da sequência
-        return torch.softmax(self.head(out[:, -1, :]), dim=1)
+        return self.head(out[:, -1, :])
 
-def prepare_features(ticks: list[dict], seq_len=30):
+
+def prepare_features(ticks: list[dict], seq_len=180, forecast_horizon=60):
     quotes = [t["quote"] for t in ticks]
-    # Necessita de uma margem segura para gerar a Média Móvel Exponencial (EMA)
-    if len(quotes) < seq_len + 15: 
+    
+    if len(quotes) < seq_len + 100: 
         return None, None
         
-    # Modelagem de dados segura usando pandas para alinhamento perfeito de índices
     df = pd.DataFrame({"close": quotes})
-    df["diffs"] = df["close"].diff()
-    df["ema10"] = df["close"].ewm(span=10, adjust=False).mean()
-    df["vol"] = df["diffs"].rolling(window=5).std()
+    
     df["returns"] = df["close"].pct_change()
-    df["signs"] = np.sign(df["diffs"])
+    df["diffs"] = df["close"].diff() / df["close"]
     
-    # Desloca o target em -1 para que a predição seja o movimento futuro
-    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    # Média Móvel Exponencial adaptada para fluxo de 1 minuto (60 períodos)
+    ema60 = df["close"].ewm(span=60, adjust=False).mean()
+    df["ema_dist"] = (df["close"] - ema60) / df["close"]
     
-    # Remove as linhas com NaN resultantes dos cálculos de features
+    # Volatilidade baseada nos últimos 30 segundos
+    df["vol"] = df["returns"].rolling(window=30).std()
+    df["signs"] = np.sign(df["close"].diff())
+    
+    # Target travado em 60 ticks no futuro (Aproximadamente 1 minuto no ativo R_100)
+    df["target"] = (df["close"].shift(-forecast_horizon) > df["close"]).astype(int)
+    
     df.dropna(inplace=True)
     
-    features = df[["diffs", "ema10", "vol", "returns", "signs"]].values
+    features_cols = ["returns", "diffs", "ema_dist", "vol", "signs"]
+    for col in features_cols:
+        if col != "signs":
+            mean = df[col].mean()
+            std = df[col].std()
+            if std != 0:
+                df[col] = (df[col] - mean) / std
+    
+    features = df[features_cols].values
     targets = df["target"].values
     
     X, y = [], []

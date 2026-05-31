@@ -3,6 +3,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 from typing import Optional
 
+
 class Settings(BaseSettings):
     DERIV_APP_ID: int = 1089
     DERIV_TOKEN: str = ""
@@ -13,7 +14,11 @@ class Settings(BaseSettings):
     CONSENSUS_THRESHOLD: float = 0.65
     QUANTUM_WEIGHT_DECAY: float = 0.98
     SYMBOL: str = "R_100"
-    DURATION: int = 5
+    
+    # Configuração de tempo atualizada para 1 Minuto
+    DURATION: int = 1
+    DURATION_UNIT: str = "m"  # "m" para minutos, "t" para ticks, "s" para segundos
+    
     STAKE: float = 10.0
     LOG_LEVEL: str = "INFO"
 
@@ -27,5 +32,6 @@ class Settings(BaseSettings):
         if not v or v == "SEU_TOKEN_DEMO_AQUI":
             raise ValueError("Configure DERIV_TOKEN no .env antes de executar")
         return v
+
 
 settings = Settings()
