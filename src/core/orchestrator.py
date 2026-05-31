@@ -16,7 +16,6 @@ class SignalEmitter(QObject):
 class OrchestratorThread(QThread):
     def __init__(self):
         super().__init__()
-        # ✅ Passa config explicitamente para evitar NameError
         self.ws = DerivWS(app_id=settings.DERIV_APP_ID, token=settings.DERIV_TOKEN)
         self.consensus = ConsensusEngine()
         self.risk = RiskManager()
@@ -26,10 +25,17 @@ class OrchestratorThread(QThread):
         self.trades_count = 0
         self.wins = 0
         self.running = False
+        self.in_trade = False
 
     def run(self):
         self.running = True
-        asyncio.run(self._async_loop())
+        # Cria um novo event loop para a thread do worker
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._async_loop())
+        finally:
+            loop.close()
 
     def stop(self):
         self.running = False
@@ -41,24 +47,34 @@ class OrchestratorThread(QThread):
             self.emitter.connection_status.emit(True)
             self.emitter.log_message.emit("✅ Deriv WebSocket conectado")
 
+            # Mapeamento de eventos do websocket
             self.ws.on("tick", self._on_tick)
             self.ws.on("balance", self._on_balance)
-            self.ws.on("trade_result", self._on_buy)
+            self.ws.on("trade_result", self._on_trade_result)
 
-            # ✅ Config passada explicitamente
+            # Inscrições Iniciais
             await self.ws.subscribe_ticks(settings.SYMBOL)
             await self.ws.subscribe_balance()
+            
+            # Inscreve-se explicitamente para acompanhar o PnL dos contratos abertos
+            await self.ws._send({"proposal_open_contract": 1, "subscribe": 1})
 
             while self.running:
                 await asyncio.sleep(0.5)
+                
         except asyncio.CancelledError:
-            self.emitter.log_message.emit("🔴 Loop async finalizado")
+            self.emitter.log_message.emit("🔴 Loop async cancelado")
         except Exception as e:
-            self.emitter.log_message.emit(f"❌ Erro crítico: {e}")
+            self.emitter.log_message.emit(f"❌ Erro crítico no Orquestrador: {e}")
+            logger.error(f"Erro crítico: {e}")
         finally:
             await self.ws.close()
+            self.emitter.connection_status.emit(False)
 
     async def _on_tick(self, data):
+        if "tick" not in data:
+            return
+            
         quote = float(data["tick"]["quote"])
         self.prices = np.append(self.prices, quote)[-500:]
         
@@ -69,33 +85,74 @@ class OrchestratorThread(QThread):
                 self.emitter.log_message.emit(f"📊 Coletando dados... {len(self.prices)}/20 ticks")
 
     async def _on_balance(self, data):
+        if "balance" not in data:
+            return
+            
         bal = float(data["balance"]["balance"])
         self.state.update(self.risk.update(bal))
         self._update_ui_state()
 
-    async def _on_buy(self, data):
-        self.trades_count += 1
-        self.emitter.log_message.emit(f"📈 Trade executado: ID {data.get('buy', {}).get('id', 'N/A')}")
+    async def _on_trade_result(self, data):
+        # 1. Confirmação de que a ordem de compra foi executada
+        if "buy" in data:
+            buy_info = data["buy"]
+            self.trades_count += 1
+            self.emitter.log_message.emit(f"📈 Contrato Aberto: ID {buy_info.get('contract_id', 'N/A')}")
+            return
+
+        # 2. Acompanhamento e finalização do contrato aberto
+        if "proposal_open_contract" in data:
+            contract = data["proposal_open_contract"]
+            
+            # Se is_sold for verdadeiro, o trade finalizou
+            if contract.get("is_sold"):
+                status = contract.get("status", "")
+                profit = float(contract.get("profit", 0.0))
+                
+                if status == "won":
+                    self.wins += 1
+                    self.emitter.log_message.emit(f"✅ WIN | Lucro: +${profit:.2f}")
+                elif status == "lost":
+                    self.emitter.log_message.emit(f"❌ LOSS | Prejuízo: ${profit:.2f}")
+
+                # Atualiza a gestão de risco e libera o sistema para um novo trade
+                self.risk.log_trade(profit)
+                self.in_trade = False
+                self._update_ui_state()
 
     async def _execute_cycle(self):
         if self.risk.circuit_breaker:
-            self.emitter.log_message.emit("🛑 Circuit Breaker ATIVO")
+            # Emite alerta apenas se estiver tentando processar algo, evita spam no log
+            if not getattr(self, '_circuit_notified', False):
+                self.emitter.log_message.emit("🛑 Circuit Breaker ATIVO - Pausa de Proteção")
+                self._circuit_notified = True
             return
 
+        self._circuit_notified = False
         sig, score, votes = self.consensus.compute(self.prices, self.state)
         self._update_ui_state(sig, score, votes)
 
-        if sig in ("CALL", "PUT") and not self.risk.circuit_breaker:
+        # Condição de entrada travada pela flag in_trade
+        if sig in ("CALL", "PUT") and not self.in_trade:
+            self.in_trade = True  # Trava imediata para não abrir operações duplicadas
             stake = self.risk.get_stake()
-            # ✅ Config passada explicitamente para execução
-            await self.ws.execute_trade(sig, stake, settings.SYMBOL, settings.DURATION)
-            self.emitter.log_message.emit(f"📤 {sig} | Stake: ${stake:.2f} | Conf: {score:.2%}")
+            
+            self.emitter.log_message.emit(f"📤 Enviando {sig} | Stake: ${stake:.2f} | Confiança: {score:.2%}")
+            
+            try:
+                await self.ws.execute_trade(sig, stake, settings.SYMBOL, settings.DURATION)
+            except Exception as e:
+                self.emitter.log_message.emit(f"⚠️ Erro ao enviar ordem: {e}")
+                self.in_trade = False  # Libera a trava em caso de falha de requisição
 
     def _update_ui_state(self, signal="HOLD", score=0.0, votes=None):
-        if votes is None: votes = {}
+        if votes is None:
+            votes = {}
+            
         pnl = self.risk.current_balance - self.risk.start_balance
-        wr = (self.wins / self.trades_count * 100) if self.trades_count else 0.0
+        wr = (self.wins / self.trades_count * 100) if self.trades_count > 0 else 0.0
+        
         self.emitter.tick_update.emit(
             self.prices.tolist(), signal, score, votes,
-            self.state["drawdown"], pnl, self.trades_count, wr
+            self.state.get("drawdown", 0.0), pnl, self.trades_count, wr
         )

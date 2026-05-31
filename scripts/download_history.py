@@ -1,12 +1,18 @@
+import sys
+import os
+
+# Garante que o Python reconheça o diretório raiz para importar o pacote 'src'
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import asyncio
 import json
 import csv
-import os
 import time
 from datetime import datetime
 import websockets
 from loguru import logger
 from src.config import settings
+
 
 async def fetch_ticks_history(symbol: str = "R_100", count: int = 5000, output_path: str = "data/history.csv"):
     os.makedirs("data", exist_ok=True)
@@ -58,6 +64,7 @@ async def fetch_ticks_history(symbol: str = "R_100", count: int = 5000, output_p
         writer.writerows(all_ticks)
         
     logger.info(f"✅ {len(all_ticks)} ticks salvos em {output_path}")
+
 
 if __name__ == "__main__":
     asyncio.run(fetch_ticks_history())

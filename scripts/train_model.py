@@ -1,3 +1,9 @@
+import sys
+import os
+
+# Garante que o Python reconheça o diretório raiz para importar o pacote 'src'
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,17 +13,19 @@ import pandas as pd
 import optuna
 from sklearn.model_selection import TimeSeriesSplit
 from loguru import logger
-import os
 
 from src.models.lstm_predictor import MarketLSTM, prepare_features
+
 
 def load_data(path: str = "data/history.csv"):
     df = pd.read_csv(path)
     df["price"] = df["price"].astype(float)
     return df["price"].values
 
+
 def build_dataloader(X, y, batch_size=32, shuffle=False):
     return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=shuffle)
+
 
 def objective(trial, X, y, device):
     hidden = trial.suggest_int("hidden", 32, 128)
@@ -49,9 +57,11 @@ def objective(trial, X, y, device):
             pred = model(X)
             acc = (torch.argmax(pred, dim=1) == y).float().mean().item()
         trial.report(acc, epoch)
-        if trial.should_prune(): raise optuna.TrialPruned()
-        
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+            
     return acc
+
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -69,8 +79,12 @@ def train():
     logger.info(f"⚙️ Melhores params: {study.best_params}")
     
     best_model = MarketLSTM(**study.best_params).to(device)
+    
+    # Garante que o diretório models existe antes de salvar os pesos
+    os.makedirs("models", exist_ok=True)
     torch.save(best_model.state_dict(), "models/best_lstm.pth")
     logger.info("💾 Modelo salvo em models/best_lstm.pth")
+
 
 if __name__ == "__main__":
     train()
