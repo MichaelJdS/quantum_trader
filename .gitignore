@@ -14,7 +14,6 @@ __pycache__/
 
 # Data and models
 /data/
-/models/
 *.pth
 
 # IDE and OS files
