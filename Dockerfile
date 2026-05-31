@@ -1,17 +1,29 @@
-FROM python:3.11-slim AS base
+# Usa a versão slim para menor footprint no servidor
+FROM python:3.11-slim
+
+# Evita que o Python grave arquivos .pyc e força o stdout direto (fundamental para logs no Docker)
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Deps do sistema para compilação de pacotes
+# Instalação de dependências de compilação do sistema
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libpq-dev && rm -rf /var/lib/apt/lists/*
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
+# Otimização do cache de pacotes
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copia a infraestrutura completa do bot
+COPY src/ src/
+COPY scripts/ scripts/
+COPY main.py .
 
-# API Service (headless, sem PyQt)
-FROM base AS api
+# Exposição da porta de métricas (Prometheus)
 EXPOSE 8000
-CMD ["uvicorn", "src.api.server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+
+# Executa o motor central
+CMD ["python", "main.py"]
