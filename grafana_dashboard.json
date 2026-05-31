@@ -1,0 +1,35 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "quantum-trader-v3",
+    "title": "QuantumTrader Core v3.0",
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1, "title": "PNL & Balance", "type": "timeseries",
+        "targets": [{"expr": "deriv_balance{job=\"quantum\"}", "legendFormat": "Balance"}],
+        "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}}}
+      },
+      {
+        "id": 2, "title": "Drawdown %", "type": "gauge",
+        "targets": [{"expr": "deriv_drawdown{job=\"quantum\"}"}],
+        "options": {"thresholds": [{"value": 3, "color": "#f029-97"}]}
+      },
+      {
+        "id": 3, "title": "Signal Distribution", "type": "piechart",
+        "targets": [{"expr": "count by (signal) (deriv_signals_total{job=\"quantum\"})"}]
+      },
+      {
+        "id": 4, "title": "Agent Confidence Heatmap", "type": "heatmap",
+        "targets": [{"expr": "avg by (agent) (deriv_agent_confidence{job=\"quantum\"})"}]
+      },
+      {
+        "id": 5, "title": "System Status", "type": "stat",
+        "targets": [{"expr": "up{job=\"quantum\"}"}],
+        "options": {"colorMode": "background"}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "5s"
+  }
+}
