@@ -11,7 +11,7 @@ pennylane>=0.33
 fastapi>=0.109
 uvicorn>=0.27
 redis>=5.0
-prometheus-fastapi-instrumentator>=6.1
+prometheus-fastapi-instrumentator
 pandas
 numpy
 scikit-learn
