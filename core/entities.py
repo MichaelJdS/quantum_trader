@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from core.enums import ContractType, StakeMode, TradeDirection, TradeStatus
@@ -34,7 +34,7 @@ class Signal:
     model_name: str
     contract_type: ContractType
     entry_price: float | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
 
 @dataclass(slots=True)
@@ -52,7 +52,7 @@ class Trade:
     exit_price: float | None = None
     payout: float | None = None
     pnl: float = 0.0
-    opened_at: datetime = field(default_factory=datetime.utcnow)
+    opened_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     closed_at: datetime | None = None
 
 

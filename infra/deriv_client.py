@@ -187,12 +187,16 @@ class DerivClient:
                         close_timeout=5,
                         max_size=2**20,  # 1MB
                     )
-                    await self._authorize()
+                    # FIX E01: _listen_loop deve iniciar ANTES de _authorize()
+                    # para que os Futures em _pending sejam resolvidos.
                     self._running = True
-                    self._circuit.record_success()
                     self._listen_task = asyncio.create_task(
                         self._listen_loop(), name="deriv_listen"
                     )
+                    # Dá um yield ao loop para que a task seja agendada.
+                    await asyncio.sleep(0)
+                    await self._authorize()
+                    self._circuit.record_success()
                     self._ping_task = asyncio.create_task(
                         self._ping_loop(), name="deriv_ping"
                     )

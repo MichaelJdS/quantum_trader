@@ -56,7 +56,7 @@ async def run(args: argparse.Namespace) -> None:
         symbols=symbols,
         granularity=args.granularity,
     )
-    await sm.initialize_all()
+    await sm.initialize()
 
     # 4. Engine + estratégias.
     session_id = str(uuid.uuid4())
