@@ -1,3 +1,6 @@
+﻿"""
+Enums do domínio Quantum Trader.
+"""
 from enum import Enum
 
 
@@ -21,14 +24,23 @@ class ContractType(str, Enum):
 
 
 class TradeStatus(str, Enum):
-    PENDING = "PENDING"
     OPEN = "OPEN"
     WON = "WON"
     LOST = "LOST"
     CANCELLED = "CANCELLED"
+    ERROR = "ERROR"
 
 
 class StakeMode(str, Enum):
     FIXED = "FIXED"
-    KELLY = "KELLY"
     ADAPTIVE = "ADAPTIVE"
+    KELLY = "KELLY"
+    FRACTIONAL = "FRACTIONAL"
+    FRACTIONAL_KELLY = "FRACTIONAL_KELLY"
+
+
+class SignalStrength(str, Enum):
+    STRONG = "STRONG"
+    MODERATE = "MODERATE"
+    WEAK = "WEAK"
+    NONE = "NONE"
