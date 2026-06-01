@@ -68,6 +68,9 @@ class SymbolManager:
         self._tick_listeners: dict[str, list[MessageCallback]] = defaultdict(list)
         self._candle_listeners: dict[str, list[MessageCallback]] = defaultdict(list)
         self._lock = asyncio.Lock()
+        # FIX B13: Flag para garantir que o callback global de tick é registrado
+        # apenas uma vez, independente de reconexões.
+        self._tick_handler_registered: bool = False
 
         raw_symbols = symbols or settings.symbols_list
         for sym in raw_symbols:
@@ -154,7 +157,13 @@ class SymbolManager:
             symbol=symbol,
             callback=None,
         )
-        self._client.on("tick", self._handle_tick)
+
+        # FIX B13: Registra o handler global de tick apenas uma vez.
+        # Sem essa verificação, cada chamada a _initialize_symbol (inclusive
+        # durante reconexões) duplicaria o callback, processando cada tick N vezes.
+        if not self._tick_handler_registered:
+            self._client.on("tick", self._handle_tick)
+            self._tick_handler_registered = True
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -170,10 +179,24 @@ class SymbolManager:
         if symbol not in self._states:
             return
 
-        price = float(tick.get("ask", tick.get("bid", 0.0)))
+        # FIX B12: Índices sintéticos da Deriv (Volatility Index) retornam
+        # o preço no campo "quote", não em "ask"/"bid" (que ficam vazios).
+        # Fallback para ask/bid mantém compatibilidade com outros tipos de ativo.
+        price_raw = tick.get("quote") or tick.get("ask") or tick.get("bid") or 0.0
+        price = float(price_raw)
         epoch = int(tick.get("epoch", 0))
         pip_size = tick.get("pip_size")
 
+        if price == 0.0:
+            logger.warning(
+                "Tick recebido com preço zero — descartado.",
+                symbol=symbol,
+                tick=tick,
+            )
+            return
+
+        # FIX B3: tick_count lido DENTRO do lock para evitar race condition.
+        should_persist = False
         async with self._lock:
             state = self._states[symbol]
             state.last_price = price
@@ -183,8 +206,11 @@ class SymbolManager:
             # Atualiza último candle do DataFrame com o preço atual.
             self._update_live_candle(state, price, epoch)
 
+            # Determina se deve persistir (dentro do lock para consistência).
+            should_persist = state.tick_count % 100 == 0
+
         # Persiste tick no banco (batch a cada 100 ticks por símbolo).
-        if state.tick_count % 100 == 0:
+        if should_persist:
             asyncio.create_task(
                 self._persist_ticks(symbol, [{"symbol": symbol, "price": price,
                                                "epoch": epoch, "pip_size": pip_size}])

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 
@@ -17,7 +17,7 @@ class RiskManager:
     Gestão de risco profissional para o Quantum Trader.
 
     Responsabilidades:
-      - Cálculo de stake via Fixed, Kelly e Adaptive.
+      - Cálculo de stake via Fixed, Kelly, Fractional Kelly e Adaptive.
       - Bloqueio de operação por drawdown, perdas consecutivas.
       - Detecção de Stop Win e Stop Loss da sessão.
       - Registro imutável de trades para cálculo de métricas.
@@ -26,7 +26,15 @@ class RiskManager:
     config: RiskConfig
     initial_balance: float
     _trades: list[Trade] = field(default_factory=list, repr=False)
-    _session_start: datetime = field(default_factory=datetime.utcnow, repr=False)
+    # FIX B11: datetime.utcnow() deprecated desde Python 3.12 — usa aware datetime.
+    _session_start: datetime = field(
+        default_factory=lambda: datetime.now(tz=timezone.utc), repr=False
+    )
+    # FIX B8: high water mark real da sessão para cálculo correto de drawdown.
+    _peak_balance: float = field(default=0.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._peak_balance = self.initial_balance
 
     # ── Stake Calculation ─────────────────────────────────────────────────────
 
@@ -47,6 +55,7 @@ class RiskManager:
         Returns:
             Stake calculado, respeitando limites de exposição.
         """
+        # FIX B2: Adicionado case para StakeMode.FRACTIONAL_KELLY e StakeMode.FRACTIONAL.
         match self.config.stake_mode:
             case StakeMode.FIXED:
                 stake = self.config.base_stake
@@ -59,14 +68,50 @@ class RiskManager:
                     stake = self.config.base_stake
                 else:
                     stake = self._kelly_stake(
-                        current_balance, win_probability, payout_multiplier
+                        current_balance, win_probability, payout_multiplier,
+                        fraction=1.0,
                     )
+
+            case StakeMode.FRACTIONAL_KELLY:
+                # FIX B2: Antes esse case não existia — causava UnboundLocalError.
+                if win_probability is None:
+                    logger.warning(
+                        "Fractional Kelly solicitado sem probabilidade — fallback para FIXED."
+                    )
+                    stake = self.config.base_stake
+                else:
+                    stake = self._kelly_stake(
+                        current_balance, win_probability, payout_multiplier,
+                        fraction=self.config.kelly_fraction,
+                    )
+
+            case StakeMode.FRACTIONAL:
+                stake = current_balance * self.config.kelly_fraction
 
             case StakeMode.ADAPTIVE:
                 stake = self._adaptive_stake(current_balance)
 
+            case _:
+                logger.warning(
+                    "StakeMode desconhecido — fallback para FIXED.",
+                    mode=self.config.stake_mode,
+                )
+                stake = self.config.base_stake
+
         max_stake = current_balance * 0.02  # Nunca mais que 2% do saldo.
         final_stake = round(min(stake, max_stake), 2)
+
+        # FIX B6: Alerta quando o mínimo da Deriv viola o limite de 2% da banca.
+        min_deriv_stake = 0.35
+        if final_stake < min_deriv_stake:
+            if current_balance > 0 and (min_deriv_stake / current_balance) > 0.02:
+                logger.warning(
+                    "Stake mínimo da Deriv ($0.35) viola limite de 2% da banca. "
+                    "Operação executada com exposição acima do limite configurado.",
+                    balance=current_balance,
+                    exposure_pct=round(min_deriv_stake / current_balance, 4),
+                )
+            final_stake = min_deriv_stake
 
         logger.debug(
             "Stake calculado.",
@@ -74,19 +119,20 @@ class RiskManager:
             stake=final_stake,
             balance=current_balance,
         )
-        return max(final_stake, 0.35)  # Mínimo Deriv: $0.35
+        return final_stake
 
     def _kelly_stake(
         self,
         balance: float,
         p: float,
         payout: float,
+        fraction: float = 1.0,
     ) -> float:
-        """Kelly Criterion fracionado: f* = (bp - q) / b * fraction."""
+        """Kelly Criterion com fração configurável: f* = (bp - q) / b * fraction."""
         b = payout - 1.0
         q = 1.0 - p
         kelly_full = (b * p - q) / b if b > 0 else 0.0
-        kelly_frac = max(kelly_full, 0.0) * self.config.kelly_fraction
+        kelly_frac = max(kelly_full, 0.0) * fraction
         return balance * kelly_frac
 
     def _adaptive_stake(self, balance: float) -> float:
@@ -115,21 +161,21 @@ class RiskManager:
         """
         # 1. Stop Loss da sessão.
         if self._session_loss_pct(session) >= self.config.stop_loss_pct:
-            return False, f"Stop Loss da sessão atingido ({self.config.stop_loss_pct:.1%})"
+            return False, f"__STOP_LOSS__: Stop Loss da sessão atingido ({self.config.stop_loss_pct:.1%})"
 
         # 2. Stop Win da sessão.
         if self._session_gain_pct(session) >= self.config.stop_win_pct:
-            return False, f"Stop Win da sessão atingido ({self.config.stop_win_pct:.1%})"
+            return False, f"__STOP_WIN__: Stop Win da sessão atingido ({self.config.stop_win_pct:.1%})"
 
         # 3. Drawdown diário.
         dd = self._daily_drawdown(session)
         if dd >= self.config.max_daily_drawdown_pct:
-            return False, f"Max drawdown diário atingido ({dd:.1%})"
+            return False, f"__STOP_LOSS__: Max drawdown diário atingido ({dd:.1%})"
 
         # 4. Perdas consecutivas.
         consec = self._count_consecutive_losses()
         if consec >= self.config.max_consecutive_losses:
-            return False, f"{consec} perdas consecutivas — pausa obrigatória"
+            return False, f"__STOP_LOSS__: {consec} perdas consecutivas — pausa obrigatória"
 
         return True, "OK"
 
@@ -137,17 +183,23 @@ class RiskManager:
         """Levanta exceção tipada se operação for bloqueada."""
         ok, reason = self.can_trade(session)
         if not ok:
-            if "Stop Win" in reason:
+            # FIX B16: Usa prefixos estruturados ao invés de string matching frágil.
+            if reason.startswith("__STOP_WIN__"):
                 raise StopWinReachedError(reason)
-            if "Stop Loss" in reason or "drawdown" in reason or "perdas" in reason:
+            if reason.startswith("__STOP_LOSS__"):
                 raise StopLossReachedError(reason)
             raise RiskViolationError(reason)
 
     # ── Registro de Trades ────────────────────────────────────────────────────
 
     def register_trade(self, trade: Trade) -> None:
-        """Adiciona trade ao histórico interno para cálculo de métricas."""
+        """Adiciona trade ao histórico interno e atualiza peak de saldo."""
         self._trades.append(trade)
+
+    def update_peak(self, current_balance: float) -> None:
+        """Atualiza high water mark do saldo. Deve ser chamado após cada trade."""
+        if current_balance > self._peak_balance:
+            self._peak_balance = current_balance
 
     # ── Métricas ──────────────────────────────────────────────────────────────
 
@@ -191,7 +243,9 @@ class RiskManager:
         return delta / session.initial_balance if session.initial_balance > 0 else 0.0
 
     def _daily_drawdown(self, session: SessionState) -> float:
-        peak = max(session.initial_balance, session.current_balance)
+        # FIX B8: Usa _peak_balance real (high water mark) ao invés de initial_balance.
+        # O peak é atualizado via update_peak() após cada trade pelo ExecutionEngine.
+        peak = max(self._peak_balance, session.current_balance)
         return (peak - session.current_balance) / peak if peak > 0 else 0.0
 
     def _count_consecutive_losses(self) -> int:

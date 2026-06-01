@@ -14,7 +14,7 @@ class BollingerReversionStrategy(StrategyBase):
 
     CALL quando:
       - Preço toca ou cruza BB lower (close < bb_lower).
-      - RSI14 < 30 (oversold).
+      - RSI14 < 32 (oversold).
       - Candle atual é bullish (fechou acima da abertura).
       - Sem tendência de queda forte (ADX < 35 ou DI- não dominante).
 
@@ -49,8 +49,20 @@ class BollingerReversionStrategy(StrategyBase):
             return None
 
         last = df.iloc[-1]
-        required = {"bb_lower", "bb_upper", "rsi_14", "adx", "squeeze", "is_bullish"}
+
+        # FIX: Adicionado "is_bearish" ao required set.
+        # O código de PUT usa last["is_bearish"] mas o set original não incluía
+        # essa feature, permitindo que a estratégia chegasse ao bloco PUT
+        # com KeyError silencioso ou valor inesperado.
+        required = {
+            "bb_lower", "bb_upper", "rsi_14", "adx",
+            "squeeze", "is_bullish", "is_bearish",
+        }
         if not required.issubset(df.columns):
+            logger.warning(
+                "Features insuficientes para BollingerReversionStrategy.",
+                missing=required - set(df.columns),
+            )
             return None
 
         if last["squeeze"] == 1:
@@ -82,9 +94,11 @@ class BollingerReversionStrategy(StrategyBase):
                 )
 
         # ── PUT: overbought + preço acima de BB upper ─────────────────────────
+        # FIX: RSI threshold padronizado para 70 (consistente com o docstring).
+        # O valor anterior era 68, criando inconsistência com a lógica documentada.
         if (
             last["close"] > last["bb_upper"]
-            and last["rsi_14"] > 68
+            and last["rsi_14"] > 70
             and last["is_bearish"] == 1
             and last["adx"] < 35
         ):

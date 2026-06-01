@@ -24,14 +24,14 @@ async def run(args: argparse.Namespace) -> None:
     from core.entities import RiskConfig
     from core.enums import StakeMode
     from core.execution_engine import ExecutionEngine
-    from core.settings import get_settings
     from core.strategies import BollingerReversionStrategy, BreakoutStrategy, EmaRsiStrategy
     from infra.deriv_client import DerivClient
     from infra.symbol_manager import SymbolManager
     from tui.app import QuantumTraderApp
     from tui.state import TUIState
 
-    settings = get_settings()
+    # FIX B10: Removida variável `settings = get_settings()` que era importada
+    # e atribuída mas nunca utilizada no restante da função.
     dry_run = not args.live
 
     # 1. Configura risco.

@@ -187,7 +187,7 @@ class DerivClient:
                         close_timeout=5,
                         max_size=2**20,  # 1MB
                     )
-                    # FIX E01: _listen_loop deve iniciar ANTES de _authorize()
+                    # _listen_loop deve iniciar ANTES de _authorize()
                     # para que os Futures em _pending sejam resolvidos.
                     self._running = True
                     self._listen_task = asyncio.create_task(
@@ -254,6 +254,13 @@ class DerivClient:
     async def _listen_loop(self) -> None:
         """Processa mensagens recebidas do WebSocket em loop contínuo."""
         while self._running:
+            # FIX B4: Verifica se _ws ainda existe antes de chamar recv().
+            # Durante reconexão, _ws pode ser None temporariamente.
+            if self._ws is None or self._ws.closed:
+                logger.warning("_listen_loop: WebSocket indisponível — aguardando reconexão.")
+                await asyncio.sleep(0.5)
+                continue
+
             try:
                 raw = await self._ws.recv()
                 data: dict = json.loads(raw)

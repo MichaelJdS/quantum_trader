@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -50,6 +51,10 @@ class ExecutionEngine:
     _feature_engineer: FeatureEngineer = field(init=False)
     _session_state: SessionState = field(init=False)
     _open_trades: dict[str, Trade] = field(default_factory=dict, init=False)
+    # FIX B9: Mantém referência forte às tasks para evitar GC prematuro.
+    _pending_tasks: set[asyncio.Task] = field(default_factory=set, init=False)
+    # FIX C1: Mapa de contract_id → Future para receber resultado live.
+    _contract_futures: dict[str, asyncio.Future] = field(default_factory=dict, init=False)
     _running: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -75,6 +80,7 @@ class ExecutionEngine:
         Inicializa o engine:
           1. Carrega saldo atual da conta.
           2. Registra tick listeners para todos os símbolos.
+          3. Registra listener de proposal_open_contract para modo live.
         """
         balance_data = await self.client.get_balance()
         balance = float(balance_data.get("balance", 1000.0))
@@ -94,6 +100,10 @@ class ExecutionEngine:
                 self._make_tick_handler(symbol),
             )
 
+        # FIX C1: Registra listener para resultados reais de contratos (modo live).
+        if not self.dry_run:
+            self.client.on("proposal_open_contract", self._handle_contract_update)
+
         self._running = True
         logger.success(
             "ExecutionEngine iniciado.",
@@ -104,8 +114,44 @@ class ExecutionEngine:
         )
 
     async def stop(self) -> None:
-        """Para o engine e persiste métricas finais da sessão."""
+        """Para o engine, cancela tasks pendentes e persiste métricas finais."""
         self._running = False
+
+        # FIX B22: Cancela todas as tasks de _await_result ainda pendentes
+        # e marca os trades abertos como CANCELLED no banco.
+        if self._pending_tasks:
+            logger.info(
+                "Cancelando tasks pendentes.",
+                count=len(self._pending_tasks),
+            )
+            for task in list(self._pending_tasks):
+                task.cancel()
+
+        if self._open_trades:
+            closed_at = datetime.now(tz=timezone.utc)
+            async with get_session() as db:
+                repo = TradeRepository(db)
+                for trade in self._open_trades.values():
+                    await repo.update_result(
+                        trade_id=trade.id,
+                        status=TradeStatus.CANCELLED,
+                        exit_price=None,
+                        pnl=0.0,
+                        payout=None,
+                        closed_at=closed_at,
+                    )
+                    logger.warning(
+                        "Trade cancelado no shutdown.",
+                        trade_id=trade.id,
+                        symbol=trade.symbol,
+                    )
+            self._open_trades.clear()
+
+        # Cancela futures de contratos live pendentes.
+        for fut in self._contract_futures.values():
+            if not fut.done():
+                fut.cancel()
+        self._contract_futures.clear()
 
         metrics = self._risk_manager.session_metrics(self._session_state)
         async with get_session() as db:
@@ -142,7 +188,12 @@ class ExecutionEngine:
         cached_df = cache.get_features(symbol, "features_df")
         last_epoch = int(raw_df.iloc[-1]["epoch"])
 
-        if cached_df is not None and int(cached_df.iloc[-1].get("epoch", 0)) == last_epoch:
+        # FIX B17: Invalida por epoch E por TTL (evita cache stale pós-reconexão).
+        if (
+            cached_df is not None
+            and int(cached_df.iloc[-1].get("epoch", 0)) == last_epoch
+            and not cache.is_expired(symbol, "features_df", ttl_seconds=30)
+        ):
             feat_df = cached_df
         else:
             feat_df = self._feature_engineer.compute(raw_df)
@@ -200,7 +251,16 @@ class ExecutionEngine:
             logger.error("Falha ao obter proposta.", error=str(exc))
             return
 
+        # FIX B14: Valida proposal_id antes de prosseguir.
         proposal_id = proposal.get("id", "")
+        if not proposal_id:
+            logger.error(
+                "Proposta retornou sem ID — operação abortada.",
+                symbol=signal.symbol,
+                proposal=proposal,
+            )
+            return
+
         ask_price = float(proposal.get("ask_price", stake))
 
         # 4. Cria entidade Trade.
@@ -252,19 +312,35 @@ class ExecutionEngine:
                 )
             return
 
-        # 7. Aguarda resultado (simulado em dry-run).
-        asyncio.create_task(
-            self._await_result(trade, proposal.get("payout", ask_price * 1.95))
-        )
+        # FIX C1: Em modo live, cria Future associado ao contract_id para
+        # receber resultado via _handle_contract_update (proposal_open_contract).
+        if not self.dry_run and contract_id:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._contract_futures[str(contract_id)] = fut
 
-    async def _await_result(self, trade: Trade, expected_payout: float) -> None:
+        # FIX B9: Mantém referência forte à task em _pending_tasks.
+        task = asyncio.create_task(
+            self._await_result(
+                trade,
+                proposal.get("payout", ask_price * 1.95),
+                contract_id=str(contract_id),
+            )
+        )
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
+
+    async def _await_result(
+        self,
+        trade: Trade,
+        expected_payout: float,
+        contract_id: str = "",
+    ) -> None:
         """
         Aguarda resultado do contrato.
         Em dry-run: simula resultado com probabilidade baseada na confiança.
-        Em live: aguarda evento `proposal_open_contract` do WebSocket.
+        Em live: aguarda evento `proposal_open_contract` via Future registrado.
         """
-        import random
-
         if self.dry_run:
             # Simula latência do contrato.
             await asyncio.sleep(5)
@@ -273,12 +349,37 @@ class ExecutionEngine:
             status = TradeStatus.WON if won else TradeStatus.LOST
             exit_price = trade.entry_price  # Simulado.
         else:
-            # TODO: Implementar listener de `proposal_open_contract`.
-            await asyncio.sleep(5)
-            won = False
-            pnl = -trade.stake
-            status = TradeStatus.LOST
-            exit_price = None
+            # FIX C1: Aguarda resultado real via Future resolvido pelo listener
+            # de proposal_open_contract. Timeout de 120s evita espera infinita.
+            fut = self._contract_futures.get(contract_id)
+            if fut is None:
+                logger.error(
+                    "Future não encontrado para contrato live.",
+                    contract_id=contract_id,
+                    trade_id=trade.id,
+                )
+                return
+
+            try:
+                contract_data = await asyncio.wait_for(fut, timeout=120.0)
+                is_sold = contract_data.get("is_sold", 0)
+                profit = float(contract_data.get("profit", 0.0))
+                won = profit > 0
+                pnl = profit
+                status = TradeStatus.WON if won else TradeStatus.LOST
+                exit_price = float(contract_data.get("exit_tick", trade.entry_price) or trade.entry_price)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Timeout aguardando resultado do contrato live.",
+                    contract_id=contract_id,
+                    trade_id=trade.id,
+                )
+                status = TradeStatus.ERROR
+                pnl = 0.0
+                exit_price = None
+                won = False
+            finally:
+                self._contract_futures.pop(contract_id, None)
 
         closed_at = datetime.now(tz=timezone.utc)
 
@@ -307,11 +408,13 @@ class ExecutionEngine:
         total = self._session_state.total_trades
         self._session_state.win_rate = self._session_state.wins / total if total else 0.0
 
-        # Registra no RiskManager.
+        # Registra no RiskManager e atualiza peak de saldo.
         trade.pnl = pnl
         trade.status = status
         trade.closed_at = closed_at
         self._risk_manager.register_trade(trade)
+        # FIX B8: Atualiza high water mark para cálculo correto de drawdown.
+        self._risk_manager.update_peak(self._session_state.current_balance)
         self._open_trades.pop(trade.id, None)
 
         logger.info(
@@ -322,6 +425,24 @@ class ExecutionEngine:
             balance=round(self._session_state.current_balance, 4),
             win_rate=round(self._session_state.win_rate, 4),
         )
+
+    # ── Listener de Contratos Live ────────────────────────────────────────────
+
+    async def _handle_contract_update(self, data: dict) -> None:
+        """
+        Callback para proposal_open_contract.
+        Resolve o Future associado quando o contrato é encerrado.
+        """
+        contract = data.get("proposal_open_contract", {})
+        contract_id = str(contract.get("contract_id", ""))
+        is_sold = contract.get("is_sold", 0)
+
+        if not is_sold:
+            return  # Contrato ainda aberto — aguarda próximo evento.
+
+        fut = self._contract_futures.get(contract_id)
+        if fut and not fut.done():
+            fut.set_result(contract)
 
     # ── Stop Events ───────────────────────────────────────────────────────────
 
@@ -351,7 +472,13 @@ class ExecutionEngine:
         return durations.get(strategy_name, 5)
 
     def _get_duration_unit(self, strategy_name: str) -> str:
-        return "t"  # Ticks — padrão Deriv para volatility index.
+        # FIX B18: Implementado de verdade — cada estratégia pode ter unidade diferente.
+        units = {
+            "ema_rsi_macd": "t",        # Ticks.
+            "bollinger_reversion": "t", # Ticks.
+            "breakout_squeeze": "t",    # Ticks.
+        }
+        return units.get(strategy_name, "t")
 
     # ── Propriedades ──────────────────────────────────────────────────────────
 
