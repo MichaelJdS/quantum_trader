@@ -10,6 +10,12 @@
 
 ---
 
+## 🆕 Atualizações Recentes
+
+- **Correções de Infraestrutura**: Melhorias de concorrência e thread-safety no `SymbolManager` e `Cache`, incluindo timestamps precisos e handlers de ticks globais otimizados.
+- **Cliente Deriv Resiliente**: Correção na inicialização assíncrona do WebSocket e fallback automático caso a conexão caia.
+- **Suporte Expandido a Ativos**: Suporte corrigido para Índices Sintéticos (Volatility Index), garantindo a leitura correta de preços pelo campo `quote`.
+
 ## ⚠️ Aviso de Risco
 
 > **Trading automatizado envolve risco real de perda de capital.**
