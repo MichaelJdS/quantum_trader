@@ -1,0 +1,1 @@
+"""Módulo de backtesting: vetorizado, event-driven, walk-forward e métricas."""

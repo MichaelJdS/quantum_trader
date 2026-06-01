@@ -1,0 +1,1 @@
+"""Domínio puro do Quantum Trader — sem I/O, sem side effects."""

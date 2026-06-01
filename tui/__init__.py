@@ -1,0 +1,1 @@
+"""Interface TUI do Quantum Trader — construída com Textual."""

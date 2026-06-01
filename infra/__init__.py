@@ -1,0 +1,1 @@
+"""Camada de infraestrutura — I/O, banco de dados, WebSocket e cache."""

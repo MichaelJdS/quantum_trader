@@ -1,25 +1,29 @@
-# Virtual environments
-venv/
-env/
-ENV/
-
-# Python cache
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Environment variables
-.env
-.env.local
-
-# Data and models
-/data/
-*.pth
-
-# IDE and OS files
-.vscode/
-.idea/
+*.so
+.Python
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.cache/
 .DS_Store
-
-# Log files
+.idea/
+.vscode/
 *.log
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+.env
+output/
+dist/
+build/
+*.egg-info/
+.mlflow/
+artifacts/
+models_store/

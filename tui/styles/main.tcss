@@ -1,0 +1,140 @@
+/* ── Quantum Trader TUI Stylesheet ─────────────────────────────────── */
+
+Screen {
+    background: $background;
+}
+
+.section-title {
+    text-style: bold;
+    color: $primary;
+    margin-bottom: 1;
+}
+
+.kpi-row {
+    height: 9;
+    margin-bottom: 1;
+}
+
+.panel {
+    border: solid $surface-lighten-1;
+    padding: 1 2;
+    margin: 0 1;
+}
+
+.filter-row {
+    height: 5;
+    align: left middle;
+    margin-bottom: 1;
+}
+
+.filter-row Label {
+    margin-right: 1;
+}
+
+.history-footer {
+    text-style: bold;
+    color: $text-muted;
+    margin-top: 1;
+}
+
+.signal-box {
+    border: solid $success;
+    padding: 1 2;
+    margin: 1;
+    min-width: 30;
+    height: 6;
+}
+
+.signal-box.signal-call {
+    border: solid $success;
+    background: $success 10%;
+}
+
+.signal-box.signal-put {
+    border: solid $error;
+    background: $error 10%;
+}
+
+.ensemble-box {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1;
+    min-width: 40;
+}
+
+.config-grid {
+    height: 12;
+    padding: 1;
+    background: $surface;
+    border: solid $surface-lighten-1;
+}
+
+.gauge-safe Bar.-complete {
+    color: $success;
+}
+
+.gauge-warning Bar.-complete {
+    color: $warning;
+}
+
+.gauge-critical Bar.-complete {
+    color: $error;
+}
+
+RiskGauge {
+    margin-bottom: 1;
+}
+
+DataTable {
+    height: 1fr;
+    margin-bottom: 1;
+}
+
+/* Header strip por aba */
+TabbedContent ContentTab {
+    text-style: bold;
+}
+
+/* Dashboard bottom row */
+#bottom_row {
+    height: 1fr;
+}
+
+#risk_metrics_panel {
+    width: 1fr;
+}
+
+#trade_ticker_panel {
+    width: 1fr;
+}
+
+/* Symbols screen */
+#symbol_header {
+    height: 4;
+    align: left middle;
+}
+
+#symbol_body {
+    height: 1fr;
+}
+
+#chart_panel {
+    width: 3fr;
+}
+
+#indicators_panel {
+    width: 2fr;
+}
+
+#signal_row {
+    height: 8;
+}
+
+/* Neurons */
+#gradient_row {
+    height: 20;
+}
+
+#ml_row {
+    height: 1fr;
+}
