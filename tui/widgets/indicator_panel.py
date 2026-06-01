@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.widget import Widget
@@ -7,6 +7,10 @@ from textual.widgets import Static
 
 class IndicatorPanel(Widget):
     """Painel de indicadores técnicos com valores formatados."""
+
+    def __init__(self, state=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.state = state
 
     def compose(self) -> ComposeResult:
         yield Static(id="indicators_text")
@@ -41,7 +45,7 @@ class IndicatorPanel(Widget):
             f"CCI        : {fmt(indicators.get('cci'))}\n"
             f"{'─' * 30}\n"
             f"ADX        : {adx_icon} {fmt(adx)}\n"
-            f"BB%        : {fmt(indicators.get('bb_pct'), 4)}\n"
+            f"BB%%        : {fmt(indicators.get('bb_pct'), 4)}\n"
             f"ATR 14     : {fmt(indicators.get('atr_14'), 4)}\n"
             f"Squeeze    : {sq_icon} {'ATIVO' if squeeze else 'LIVRE'}\n"
             f"Streak     : {indicators.get('candle_streak', 0):+d}\n"
