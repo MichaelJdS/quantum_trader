@@ -17,10 +17,10 @@ class KPICard(Widget):
         height: 7;
         background: $surface;
     }
-    KPICard .kpi-title { color: $text-muted; text-style: bold; }
-    KPICard .kpi-value { color: $text; text-style: bold; font-size: 1.2; }
+    KPICard .kpi-title    { color: $text-muted; text-style: bold; }
+    KPICard .kpi-value    { color: $text;       text-style: bold; }
     KPICard .kpi-value.positive { color: $success; }
-    KPICard .kpi-value.negative { color: $error; }
+    KPICard .kpi-value.negative { color: $error;   }
     KPICard .kpi-subtitle { color: $text-muted; }
     """
 
@@ -41,15 +41,31 @@ class KPICard(Widget):
     def compose(self) -> ComposeResult:
         yield Label(self._title, classes="kpi-title")
         yield Static(self._value, id="kpi_val", classes="kpi-value")
-        yield Label(self._subtitle, classes="kpi-subtitle")
+        # FIX: id dedicado para que update_subtitle não confunda com o título.
+        yield Label(self._subtitle, id="kpi_sub", classes="kpi-subtitle")
 
     def update_value(self, value: str) -> None:
         widget = self.query_one("#kpi_val", Static)
         widget.update(value)
-        if self._color_value:
-            is_positive = not value.startswith("-")
-            widget.set_class(is_positive, "positive")
-            widget.set_class(not is_positive, "negative")
+
+        # FIX: Guard movido para antes da query — evita trabalho desnecessário
+        # quando color_value=False (era feito depois, inútil).
+        if not self._color_value:
+            return
+
+        # FIX: Trata valor zero como neutro (sem classe positiva nem negativa).
+        # Antes "-0.00" era negativo e "0.00" positivo, causando coloração
+        # errada em resultados de empate ou valores ainda não calculados.
+        try:
+            numeric = float(value.replace("%", "").replace("$", "").strip())
+        except ValueError:
+            numeric = 0.0
+
+        widget.set_class(numeric > 0, "positive")
+        widget.set_class(numeric < 0, "negative")
 
     def update_subtitle(self, subtitle: str) -> None:
-        self.query_one(Label).update(subtitle)
+        # FIX: Usa id "#kpi_sub" ao invés de query_one(Label).
+        # query_one(Label) retornava o PRIMEIRO Label encontrado (o título),
+        # sobrescrevendo o título ao invés do subtítulo.
+        self.query_one("#kpi_sub", Label).update(subtitle)
