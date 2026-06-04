@@ -1,0 +1,62 @@
+# =================================================================
+#  Quantum Trader — Requirements CLOUD (Python 3.11+)
+#  Versão enxuta para o backend no Compute Engine e2-micro.
+#  SEM PyQt6, sem textual, sem torch pesado.
+# =================================================================
+
+# ── API Server ────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+websockets==12.0
+httpx==0.27.0
+
+# ── Core Async ────────────────────────────────────────────────────
+aiohttp==3.9.5
+asyncio-throttle==1.0.2
+tenacity==8.3.0
+
+# ── Validação ─────────────────────────────────────────────────────
+pydantic==2.7.4
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+
+# ── Banco de Dados ────────────────────────────────────────────────
+sqlalchemy==2.0.30
+aiosqlite==0.20.0
+alembic==1.13.1
+
+# ── Análise de Dados ──────────────────────────────────────────────
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+
+# ── Machine Learning ──────────────────────────────────────────────
+scikit-learn==1.5.1
+# PyTorch CPU-only para a VM (sem CUDA — e2-micro não tem GPU)
+torch==2.3.0
+torchvision==0.18.0
+
+# ── Online Learning ───────────────────────────────────────────────
+river==0.21.2
+
+# ── MLOps ─────────────────────────────────────────────────────────
+mlflow==2.14.1
+
+# ── Gemini AI (free tier via Google AI Studio) ────────────────────
+google-generativeai==0.7.2
+
+# ── Logging ───────────────────────────────────────────────────────
+loguru==0.7.2
+structlog==24.2.0
+
+# ── Serialização ─────────────────────────────────────────────────
+orjson==3.10.5
+
+# ── Utilitários ───────────────────────────────────────────────────
+python-dateutil==2.9.0
+pytz==2024.1
+cachetools==5.3.3
+
+# ── Segurança ─────────────────────────────────────────────────────
+cryptography==42.0.8
+python-jose==3.3.0

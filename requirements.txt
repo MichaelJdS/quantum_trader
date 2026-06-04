@@ -79,6 +79,17 @@ pytest-timeout==2.3.1
 hypothesis==6.108.5
 freezegun==1.5.1
 
+# ── API Cloud Backend ─────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# ── Gemini AI (Google AI Studio — free tier) ──────────────────────
+google-generativeai==0.7.2
+
+# ── Desktop App (Windows GUI) ─────────────────────────────────────
+PyQt6==6.7.0
+PyQt6-Qt6==6.7.0
+
 # ── Qualidade de Codigo ───────────────────────────────────────────
 ruff==0.5.0
 mypy==1.10.1

@@ -327,6 +327,9 @@ class DerivClient:
         Envia mensagem e aguarda resposta via Future (req_id matching).
         Aplica rate limiting antes do envio.
         """
+        if self._ws is None:
+            raise DerivConnectionError("WebSocket não está conectado.")
+
         await self._rate_limiter.acquire()
 
         self._req_id += 1
@@ -344,7 +347,7 @@ class DerivClient:
 
         try:
             return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(self._req_id, None)
             raise TimeoutError(f"Timeout ({timeout}s) aguardando resposta. payload={payload}")
 
@@ -408,6 +411,18 @@ class DerivClient:
         await self._send_raw({"forget_all": "ticks"}, timeout=5.0)
         self._subscriptions.clear()
         logger.info("Todas as subscriptions canceladas.")
+
+    async def subscribe_open_contracts(self) -> None:
+        """Inscreve em atualizações de todos os contratos abertos."""
+        response = await self._send_raw(
+            {"proposal_open_contract": 1, "subscribe": 1},
+            timeout=10.0,
+        )
+        if "error" in response:
+            raise DerivConnectionError(
+                f"Erro ao inscrever contratos abertos: {response['error']['message']}"
+            )
+        logger.info("Inscrito em atualizações de contratos abertos.")
 
     # ── Dados de Mercado ──────────────────────────────────────────────────────
 

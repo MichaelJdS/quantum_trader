@@ -32,7 +32,7 @@ class EmaRsiStrategy(StrategyBase):
         risk_config: RiskConfig,
         duration: int = 5,
         duration_unit: str = "t",
-        min_confidence: float = 0.60,
+        min_confidence: float = 0.48,
     ) -> None:
         super().__init__(name="ema_rsi_macd", risk_config=risk_config)
         self.duration = duration
@@ -45,50 +45,34 @@ class EmaRsiStrategy(StrategyBase):
         symbol: str,
         session: SessionState,
     ) -> Signal | None:
-        # Guard mínimo interno: o ExecutionEngine garante 55+ candles,
-        # mas mantemos o guard para uso isolado/testes da estratégia.
-        if len(df) < 3:
+        if len(df) < 30:
             return None
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        required_cols = {
-            "ema_9", "ema_21", "ema_50", "rsi_14",
-            "macd_hist", "adx", "squeeze", "atr_14",
-        }
+        required_cols = {"ema_9", "ema_21", "rsi_14", "macd_hist"}
         if not required_cols.issubset(df.columns):
-            logger.warning(
-                "Features insuficientes para EmaRsiStrategy.",
-                missing=required_cols - set(df.columns),
-            )
             return None
 
-        # ── Filtros de condição de mercado ────────────────────────────────────
+        rsi = float(last["rsi_14"])
+        macd = float(last["macd_hist"])
+        e9 = float(last["ema_9"])
+        e21 = float(last["ema_21"])
+        pe9 = float(prev["ema_9"])
+        pe21 = float(prev["ema_21"])
 
-        if last["squeeze"] == 1:
-            return None  # Mercado comprimido — aguardar breakout.
+        # ── Sinal CALL: EMA9 acima ou cruzando EMA21 + RSI entre 45-72 + MACD positivo
+        call_trend = e9 > e21  # EMA9 acima de EMA21
+        call_cross = pe9 <= pe21 and e9 > e21  # crossover bullish recente
+        call_rsi = 45 < rsi < 72
+        call_macd = macd > 0
 
-        atr_threshold = df["atr_14"].tail(50).quantile(0.20)
-        if last["atr_14"] < atr_threshold:
-            return None  # Volatilidade muito baixa.
-
-        # ── Sinal CALL ────────────────────────────────────────────────────────
-
-        ema_cross_bull = prev["ema_9"] <= prev["ema_21"] and last["ema_9"] > last["ema_21"]
-        trend_aligned = last["ema_9"] > last["ema_21"] > last["ema_50"]
-        # FIX B7: Range ajustado para 50-65 (era 45-65).
-        # O range anterior sobrepunha o range de PUT (35-55) entre 45 e 55,
-        # criando ambiguidade de direção quando RSI estava nessa faixa.
-        rsi_ok_bull = 50 < last["rsi_14"] < 65
-        macd_bull = last["macd_hist"] > 0
-        adx_trending = last["adx"] > 20
-
-        if ema_cross_bull and trend_aligned and rsi_ok_bull and macd_bull and adx_trending:
+        if (call_trend or call_cross) and call_rsi and call_macd:
             confidence = self._compute_confidence(
                 last,
                 direction="bull",
-                conditions=[ema_cross_bull, trend_aligned, rsi_ok_bull, macd_bull, adx_trending],
+                conditions=[call_trend, call_rsi, call_macd],
             )
             if confidence >= self.min_confidence:
                 logger.info(
@@ -96,8 +80,8 @@ class EmaRsiStrategy(StrategyBase):
                     symbol=symbol,
                     strategy=self.name,
                     confidence=confidence,
-                    rsi=round(last["rsi_14"], 2),
-                    adx=round(last["adx"], 2),
+                    rsi=round(rsi, 2),
+                    ema9_vs_21=round(e9 - e21, 5),
                 )
                 return Signal(
                     symbol=symbol,
@@ -109,21 +93,17 @@ class EmaRsiStrategy(StrategyBase):
                     entry_price=float(last["close"]),
                 )
 
-        # ── Sinal PUT ─────────────────────────────────────────────────────────
+        # ── Sinal PUT: EMA9 abaixo ou cruzando EMA21 + RSI entre 28-55 + MACD negativo
+        put_trend = e9 < e21
+        put_cross = pe9 >= pe21 and e9 < e21
+        put_rsi = 28 < rsi < 55
+        put_macd = macd < 0
 
-        ema_cross_bear = prev["ema_9"] >= prev["ema_21"] and last["ema_9"] < last["ema_21"]
-        trend_aligned_bear = last["ema_9"] < last["ema_21"] < last["ema_50"]
-        # FIX B7: Range ajustado para 35-50 (era 35-55).
-        # Ranges CALL (50-65) e PUT (35-50) agora são mutuamente exclusivos —
-        # RSI = 50 não pertence a nenhum (zona neutra intencional).
-        rsi_ok_bear = 35 < last["rsi_14"] < 50
-        macd_bear = last["macd_hist"] < 0
-
-        if ema_cross_bear and trend_aligned_bear and rsi_ok_bear and macd_bear and adx_trending:
+        if (put_trend or put_cross) and put_rsi and put_macd:
             confidence = self._compute_confidence(
                 last,
                 direction="bear",
-                conditions=[ema_cross_bear, trend_aligned_bear, rsi_ok_bear, macd_bear, adx_trending],
+                conditions=[put_trend, put_rsi, put_macd],
             )
             if confidence >= self.min_confidence:
                 logger.info(
@@ -131,8 +111,8 @@ class EmaRsiStrategy(StrategyBase):
                     symbol=symbol,
                     strategy=self.name,
                     confidence=confidence,
-                    rsi=round(last["rsi_14"], 2),
-                    adx=round(last["adx"], 2),
+                    rsi=round(rsi, 2),
+                    ema9_vs_21=round(e9 - e21, 5),
                 )
                 return Signal(
                     symbol=symbol,

@@ -32,7 +32,7 @@ class BollingerReversionStrategy(StrategyBase):
         risk_config: RiskConfig,
         duration: int = 3,
         duration_unit: str = "t",
-        min_confidence: float = 0.58,
+        min_confidence: float = 0.40,
     ) -> None:
         super().__init__(name="bollinger_reversion", risk_config=risk_config)
         self.duration = duration
@@ -65,15 +65,13 @@ class BollingerReversionStrategy(StrategyBase):
             )
             return None
 
-        if last["squeeze"] == 1:
-            return None
 
         # ── CALL: oversold + preço abaixo de BB lower ─────────────────────────
         if (
             last["close"] < last["bb_lower"]
-            and last["rsi_14"] < 32
+            and last["rsi_14"] < 42
             and last["is_bullish"] == 1
-            and last["adx"] < 35
+            and last["adx"] < 40
         ):
             confidence = self._confidence(last, "bull")
             if confidence >= self.min_confidence:
@@ -98,9 +96,9 @@ class BollingerReversionStrategy(StrategyBase):
         # O valor anterior era 68, criando inconsistência com a lógica documentada.
         if (
             last["close"] > last["bb_upper"]
-            and last["rsi_14"] > 70
+            and last["rsi_14"] > 62
             and last["is_bearish"] == 1
-            and last["adx"] < 35
+            and last["adx"] < 40
         ):
             confidence = self._confidence(last, "bear")
             if confidence >= self.min_confidence:

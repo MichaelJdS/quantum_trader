@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     prometheus_port: int = Field(default=9108, ge=1024, le=65535)
 
+    # ── Gemini AI ─────────────────────────────────────────────────────────────
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_interval: int = Field(default=300, ge=60)  # segundos
+
     # ── Propriedades derivadas ────────────────────────────────────────────────
     @property
     def is_production(self) -> bool:

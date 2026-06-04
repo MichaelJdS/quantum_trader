@@ -26,6 +26,7 @@ class SymbolState:
     last_price: float = 0.0
     last_epoch: int = 0
     tick_count: int = 0
+    recent_ticks: list[dict] = field(default_factory=list)  # Armazena os últimos N ticks para análise (ARES)
     candles_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     is_ready: bool = False  # True após carga inicial de candles.
 
@@ -131,7 +132,7 @@ class SymbolManager:
         """Inicialização de um símbolo individual."""
         state = self._states[symbol]
 
-        # 1. Carrega candles da API.
+        # 1. Carrega candles da API (necessário para as estratégias funcionarem).
         candles = await self._client.get_candles(
             symbol=symbol,
             granularity=self._granularity,
@@ -147,23 +148,42 @@ class SymbolManager:
                 count=len(candles),
             )
 
-            # 2. Persiste candles no banco.
-            async with get_session() as db:
-                repo = CandleRepository(db)
-                await repo.bulk_upsert(symbol, self._granularity, candles)
+            # 2. Persiste candles no banco (best-effort — não bloqueia o início).
+            try:
+                async with get_session() as db:
+                    repo = CandleRepository(db)
+                    await repo.bulk_upsert(symbol, self._granularity, candles)
+            except Exception as exc:
+                logger.warning(
+                    "Não foi possível persistir candles no banco (não crítico).",
+                    symbol=symbol,
+                    error=str(exc),
+                )
+        else:
+            logger.warning(
+                "Nenhum candle retornado pela API — símbolo pode estar inativo.",
+                symbol=symbol,
+            )
 
-        # 3. Subscribe a ticks ao vivo.
-        await self._client.subscribe_ticks(
-            symbol=symbol,
-            callback=None,
-        )
-
-        # FIX B13: Registra o handler global de tick apenas uma vez.
-        # Sem essa verificação, cada chamada a _initialize_symbol (inclusive
-        # durante reconexões) duplicaria o callback, processando cada tick N vezes.
-        if not self._tick_handler_registered:
-            self._client.on("tick", self._handle_tick)
-            self._tick_handler_registered = True
+        # 3. Subscribe a ticks ao vivo (best-effort — falha não impede operação).
+        # O ExecutionEngine possui um polling loop que atualiza as velas
+        # periodicamente caso a subscription falhe.
+        try:
+            await self._client.subscribe_ticks(
+                symbol=symbol,
+                callback=None,
+            )
+            # FIX B13: Registra o handler global de tick apenas uma vez.
+            if not self._tick_handler_registered:
+                self._client.on("tick", self._handle_tick)
+                self._tick_handler_registered = True
+            logger.info("Subscription de ticks ativa.", symbol=symbol)
+        except Exception as exc:
+            logger.warning(
+                "Falha ao subscrever ticks — usando modo polling.",
+                symbol=symbol,
+                error=str(exc),
+            )
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -202,6 +222,11 @@ class SymbolManager:
             state.last_price = price
             state.last_epoch = epoch
             state.tick_count += 1
+            
+            # Mantém os últimos 60 ticks na memória para o ARES agent
+            state.recent_ticks.append(tick)
+            if len(state.recent_ticks) > 60:
+                state.recent_ticks.pop(0)
 
             # Atualiza último candle do DataFrame com o preço atual.
             self._update_live_candle(state, price, epoch)
@@ -258,10 +283,10 @@ class SymbolManager:
             idx = len(state.candles_df) - 1
             state.candles_df.at[idx, "close"] = price
             state.candles_df.at[idx, "high"] = max(
-                state.candles_df.at[idx, "high"], price
+                float(state.candles_df.at[idx, "high"]), price  # type: ignore
             )
             state.candles_df.at[idx, "low"] = min(
-                state.candles_df.at[idx, "low"], price
+                float(state.candles_df.at[idx, "low"]), price  # type: ignore
             )
 
     # ── Persistência ──────────────────────────────────────────────────────────
@@ -281,10 +306,18 @@ class SymbolManager:
     # ── API Pública ───────────────────────────────────────────────────────────
 
     def get_candles_df(self, symbol: str) -> pd.DataFrame:
-        """Retorna DataFrame de candles ao vivo do símbolo."""
-        if symbol not in self._states:
-            raise SymbolNotSupportedError(f"Símbolo não registrado: {symbol}")
-        return self._states[symbol].candles_df.copy()
+        """Retorna o DataFrame atualizado de candles do símbolo (thread-safe)."""
+        state = self._states.get(symbol)
+        if not state or state.candles_df.empty:
+            return pd.DataFrame()
+        return state.candles_df.copy()
+
+    def get_recent_ticks(self, symbol: str) -> list[dict]:
+        """Retorna a lista de ticks recentes para análise de microestrutura."""
+        state = self._states.get(symbol)
+        if not state:
+            return []
+        return list(state.recent_ticks)
 
     def get_last_price(self, symbol: str) -> float:
         """Retorna último preço recebido do símbolo."""
