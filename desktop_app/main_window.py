@@ -201,8 +201,13 @@ class MainWindow(QMainWindow):
         
         self._full_trades_table = QTableWidget(0, 6)
         self._full_trades_table.setHorizontalHeaderLabels(["HORA", "SÍMBOLO", "DIR", "STAKE", "PNL", "CONF"])
-        self._full_trades_table.horizontalHeader().setStretchLastSection(True)
-        self._full_trades_table.verticalHeader().setVisible(False)
+        h_header = self._full_trades_table.horizontalHeader()
+        if h_header is not None:
+            h_header.setStretchLastSection(True)
+            
+        v_header = self._full_trades_table.verticalHeader()
+        if v_header is not None:
+            v_header.setVisible(False)
         self._full_trades_table.setAlternatingRowColors(True)
         self._full_trades_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._full_trades_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)

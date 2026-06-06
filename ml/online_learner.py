@@ -14,6 +14,7 @@ try:
     RIVER_AVAILABLE = True
 except ImportError:
     RIVER_AVAILABLE = False
+    drift = linear_model = metrics = preprocessing = stream = None  # type: ignore
     logger.warning("River não instalado — online learning desabilitado.")
 
 
@@ -275,7 +276,7 @@ class OnlineLearner:
 
     def _extract_features(self, features: pd.Series | dict) -> dict[str, float]:
         """Extrai e normaliza features para o modelo River (dict float)."""
-        if isinstance(features, pd.Series):
+        if hasattr(features, "to_dict"):
             row = features.to_dict()
         else:
             row = features

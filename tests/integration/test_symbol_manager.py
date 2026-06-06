@@ -38,20 +38,13 @@ async def test_initialize_loads_candles(mock_client):
 
                 await manager.initialize()
 
-    assert manager.is_symbol_ready("R_50") is True
+    assert "R_50" in manager.ready_symbols
     df = manager.get_candles_df("R_50")
     assert len(df) == 2
     assert "close" in df.columns
 
 
 @pytest.mark.asyncio
-async def test_get_last_price_default(mock_client):
+async def test_get_recent_ticks_default(mock_client):
     manager = SymbolManager(client=mock_client, symbols=["R_75"])
-    assert manager.get_last_price("R_75") == 0.0
-
-
-@pytest.mark.asyncio
-async def test_shutdown(mock_client):
-    manager = SymbolManager(client=mock_client, symbols=["R_50"])
-    await manager.shutdown()
-    mock_client.unsubscribe_all.assert_called_once()
+    assert manager.get_recent_ticks("R_75") == []

@@ -35,7 +35,7 @@ def make_equity(trades: list[BacktestTrade], initial: float = 1000.0) -> pd.Seri
 def test_win_rate_computed_correctly():
     trades = make_trades(100, win_rate=0.60)
     equity = make_equity(trades)
-    dd = PerformanceMetrics._compute_drawdown(equity)
+    dd = _compute_drawdown(equity)
     m = PerformanceMetrics.compute(trades, equity, dd, initial_balance=1000.0)
     assert abs(m["win_rate"] - 0.60) < 0.02
 
@@ -43,7 +43,7 @@ def test_win_rate_computed_correctly():
 def test_profit_factor_above_1_for_positive_strategy():
     trades = make_trades(200, win_rate=0.60)
     equity = make_equity(trades)
-    dd = PerformanceMetrics._compute_drawdown(equity)
+    dd = _compute_drawdown(equity)
     m = PerformanceMetrics.compute(trades, equity, dd, initial_balance=1000.0)
     assert m["profit_factor"] > 1.0
 
@@ -52,7 +52,7 @@ def test_no_nan_in_metrics():
     import math
     trades = make_trades(50, win_rate=0.50)
     equity = make_equity(trades)
-    dd = PerformanceMetrics._compute_drawdown(equity)
+    dd = _compute_drawdown(equity)
     m = PerformanceMetrics.compute(trades, equity, dd, initial_balance=1000.0)
     for k, v in m.items():
         assert not math.isnan(v), f"NaN em {k}"
@@ -77,4 +77,4 @@ def _compute_drawdown(equity):
     return (equity - rolling_max) / (rolling_max + 1e-10)
 
 
-PerformanceMetrics._compute_drawdown = staticmethod(_compute_drawdown)
+PerformanceMetrics._compute_drawdown = staticmethod(_compute_drawdown)  # type: ignore
