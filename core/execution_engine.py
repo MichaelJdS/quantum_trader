@@ -26,6 +26,7 @@ from infra.symbol_manager import SymbolManager
 from ml.feature_engineer import FeatureEngineer
 from ml.gemini_advisor import GeminiAdvisor, build_context_from_df
 from ml.council.grand_oracle import GrandOracle, CouncilDecision
+from ml.signal_quality_gate import get_signal_gate, SignalQualityGate
 
 
 @dataclass
@@ -91,9 +92,9 @@ class ExecutionEngine:
         self._gemini_risk_flag: bool = False
         self._symbol_locks = {}
         self._last_processed_epoch = {}
-        # Inicializa o Grand Oracle com referência ao Gemini
+        # Inicializa o Grand Oracle
         if self.grand_oracle is None:
-            self.grand_oracle = GrandOracle(gemini_advisor=self.gemini_advisor)
+            self.grand_oracle = GrandOracle()
 
     def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
         lock = self._symbol_locks.get(symbol)
@@ -318,11 +319,35 @@ class ExecutionEngine:
             # 3. Ordena estratégias: Gemini prioriza uma delas movendo-a para frente.
             strategies = self._get_ordered_strategies()
 
-            # 4. Avalia cada estratégia (com possível ajuste de confiança do Gemini).
+            # 4. Avalia cada estratégia com filtro de qualidade
+            quality_gate: SignalQualityGate = get_signal_gate()
+
             for strategy in strategies:
                 signal = strategy.generate_signal(feat_df, symbol, self._session_state)
                 if signal is None:
                     continue
+
+                # ── SignalQualityGate: filtra falsos sinais ───────────────────
+                quality_report = quality_gate.evaluate(signal, feat_df, self._session_state)
+                if not quality_report.passed:
+                    logger.debug(
+                        "Sinal rejeitado pelo QualityGate.",
+                        symbol=symbol,
+                        reason=quality_report.rejection_reason,
+                    )
+                    continue
+
+                # Aplica boost de qualidade à confiança
+                if quality_report.boost != 1.0:
+                    signal = Signal(
+                        symbol=signal.symbol,
+                        direction=signal.direction,
+                        confidence=min(1.0, signal.confidence * quality_report.boost),
+                        strategy_name=signal.strategy_name,
+                        model_name=signal.model_name,
+                        contract_type=signal.contract_type,
+                        entry_price=signal.entry_price,
+                    )
 
                 # Aplica o multiplicador de confiança do Gemini
                 if self._gemini_confidence_mult != 1.0:
@@ -336,9 +361,8 @@ class ExecutionEngine:
                         entry_price=signal.entry_price,
                     )
 
-                # ── Oracle Council: votação dos 8 especialistas ──────────────────
+                # ── Oracle Council: votação dos especialistas ────────────────
                 if self.grand_oracle is not None:
-                    # Coleta DataFrames dos outros símbolos para LUMEN
                     peer_dfs = {
                         s: self._feature_engineer.compute(
                             self.symbol_manager.get_candles_df(s)
@@ -349,7 +373,7 @@ class ExecutionEngine:
                     peer_dfs = {s: df for s, df in peer_dfs.items() if not df.empty}
 
                     ticks = self.symbol_manager.get_recent_ticks(symbol)
-                    decision = await self.grand_oracle.evaluate(
+                    decision = self.grand_oracle.analyze(
                         signal=signal,
                         df=feat_df,
                         session=self._session_state,
@@ -357,32 +381,47 @@ class ExecutionEngine:
                         peer_dfs=peer_dfs or None,
                     )
 
-                    # Broadcast do voto do Conselho para o dashboard
                     if self.broadcast_fn:
-                        await self.broadcast_fn("council_vote", decision.summary())
+                        votes_list = []
+                        for v in decision.get("votes", {}).values():
+                            votes_list.append({
+                                "agent": v.agent_name,
+                                "action": v.action,
+                                "confidence": round(v.score, 4),
+                                "veto": v.veto,
+                                "reasoning": v.reasoning,
+                            })
+                        summary = {
+                            "approved": decision["approved"],
+                            "action": decision["direction"],
+                            "confidence": decision["confidence"],
+                            "veto_by": decision["vetoed_by"],
+                            "reasoning": decision["reasoning"],
+                            "votes": votes_list,
+                        }
+                        await self.broadcast_fn("council_vote", summary)
 
-                    if not decision.approved:
+                    if not decision["approved"]:
                         logger.info(
                             "Oracle Council bloqueou o trade.",
                             symbol=symbol,
-                            score=round(decision.weighted_score, 3),
-                            veto_by=decision.veto_by,
+                            score=decision["confidence"],
+                            veto_by=decision["vetoed_by"],
                         )
                         break
 
-                    # Ajusta confiança do sinal com base na decisão do Conselho
                     signal = Signal(
                         symbol=signal.symbol,
                         direction=signal.direction,
-                        confidence=min(1.0, decision.final_confidence),
+                        confidence=min(1.0, decision["confidence"]),
                         strategy_name=signal.strategy_name,
-                        model_name=f"council({decision.weighted_score:.2f})",
+                        model_name=f"council({decision['confidence']:.2f})",
                         contract_type=signal.contract_type,
                         entry_price=signal.entry_price,
                     )
 
                 await self._handle_signal(signal)
-                break  # Uma operação por tick por símbolo.
+                break
 
     async def _consult_gemini(self, feat_df, symbol: str) -> None:
         """Consulta o Gemini Advisor e atualiza as prioridades/flags."""
@@ -637,6 +676,17 @@ class ExecutionEngine:
             self._strategy_results[trade.strategy_name].append(won)
             if len(self._strategy_results[trade.strategy_name]) > 50:
                 self._strategy_results[trade.strategy_name].pop(0)
+
+            # Notifica QualityGate e Oracle do resultado
+            quality_gate = get_signal_gate()
+            quality_gate.record_outcome(trade, won)
+            if self.grand_oracle is not None:
+                self.grand_oracle.notify_outcome(
+                    action=trade.direction.value if hasattr(trade.direction, "value") else str(trade.direction),
+                    won=won,
+                    pnl=pnl,
+                    signal=getattr(trade, "signal_name", trade.strategy_name),
+                )
 
             logger.info(
                 "Resultado do trade.",

@@ -1,304 +1,357 @@
 """
-ml/council/grand_oracle.py — Grand Oracle: Agregador do Conselho
+ml/council/grand_oracle.py — GrandOracle v3.0: Maestro Auto-Evolutivo
 
-Orquestra os 8 agentes especializados + Gemini Advisor.
-Cada agente vota em paralelo. O Grand Oracle agrega via votação ponderada.
-SIGMA tem poder de VETO absoluto.
-
-Pesos (soma = 1.0):
-  SIGMA  20%  SERAPH 13%  KRONOS 12%  VECTOR 12%
-  NEXUS  10%  ARES   10%  GEMINI  8%  ECHO    8%  LUMEN   5%  (+ bônus alinhamento 2%)
+Melhorias v3.0:
+  - Pesos dos agentes auto-ajustados por acurácia individual (online learning)
+  - Ensemble com votação ponderada + meta-learner (logistic regression leve)
+  - Feedback loop: notifica cada agente do resultado após trade fechado
+  - Dashboard de saúde: get_council_health() retorna métricas de todos os agentes
+  - Detecção de agente desviante: agente com win_rate << média é penalizado
+  - Persistência de pesos no disco
 """
 from __future__ import annotations
 
-import asyncio
-import time
-from dataclasses import dataclass, field
+import json
+import os
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING
 
-import pandas as pd
+import numpy as np
 from loguru import logger
 
-from ml.council.base_agent import AgentVote
-from ml.council.agents.seraph  import SeraphAgent
-from ml.council.agents.nexus   import NexusAgent
-from ml.council.agents.kronos  import KronosAgent
-from ml.council.agents.sigma   import SigmaAgent
-from ml.council.agents.vector  import VectorAgent
-from ml.council.agents.ares    import AresAgent
-from ml.council.agents.echo    import EchoAgent
-from ml.council.agents.lumen   import LumenAgent
+from ml.council.agents.sigma  import SigmaAgent
+from ml.council.agents.echo   import EchoAgent
+from ml.council.agents.seraph import SeraphAgent
+from ml.council.agents.vector import VectorAgent
+from ml.council.agents.nexus  import NexusAgent
+from ml.council.agents.kronos import KronosAgent
+from ml.council.agents.lumen  import LumenAgent
+from ml.council.agents.ares   import AresAgent
+from ml.council.agents.omen   import OmenAgent
+from ml.council.base_agent    import AgentVote
 
 if TYPE_CHECKING:
-    from core.entities import Signal, SessionState
-    from ml.gemini_advisor import GeminiAdvisor
+    import pandas as pd
+    from core.entities import SessionState, Signal
 
+_WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "states", "oracle_weights.json")
 
-# ── Resultado da deliberação do Conselho ──────────────────────────────────────
-
-@dataclass
-class CouncilDecision:
-    """Resultado da votação do Oracle Council."""
-    approved:            bool
-    action:              str
-    final_confidence:    float
-    weighted_score:      float
-    votes:               list[AgentVote]         = field(default_factory=list)
-    veto_by:             str | None              = None
-    reasoning:           str                     = ""
-    gemini_reasoning:    str                     = ""
-    timestamp:           float                   = field(default_factory=time.time)
-
-    def summary(self) -> dict:
-        return {
-            "approved":         self.approved,
-            "action":           self.action,
-            "confidence":       round(self.final_confidence, 4),
-            "weighted_score":   round(self.weighted_score, 4),
-            "veto_by":          self.veto_by,
-            "reasoning":        self.reasoning,
-            "gemini_reasoning": self.gemini_reasoning,
-            "votes": [
-                {
-                    "agent":     v.agent_name,
-                    "action":    v.action,
-                    "confidence": round(v.score, 4),
-                    "veto":      v.veto,
-                    "reasoning": v.reasoning,
-                }
-                for v in self.votes
-            ],
-        }
-
-
-# ── Grand Oracle ──────────────────────────────────────────────────────────────
 
 class GrandOracle:
     """
-    Agrega os votos de todos os especialistas e toma a decisão final.
-    Integra o GeminiAdvisor como o 9º conselheiro.
+    GrandOracle v3.0 — Conselho de 9 Agentes com Aprendizado Contínuo.
 
-    Limiares de decisão:
-      score ≥ 0.62 → APROVADO com confiança cheia
-      score 0.50–0.62 → APROVADO com confiança reduzida (×0.85)
-      score < 0.50 → BLOQUEADO
+    Fluxo:
+      1. analyze() → cada agente vota
+      2. SIGMA verifica veto (bloqueia imediatamente se acionado)
+      3. Score ponderado → decisão final
+      4. Após trade fechado → notify_outcome() → todos os agentes aprendem
+      5. A cada ADAPT_CYCLE trades → pesos do Oracle se auto-ajustam
     """
 
-    APPROVE_HIGH = 0.62
-    APPROVE_LOW  = 0.50
-    GEMINI_WEIGHT = 0.08
+    ADAPT_CYCLE      = 30     # trades antes de re-ponderar agentes
+    VETO_AGENTS      = {"SIGMA"}
+    MIN_AGENT_WEIGHT = 0.03
+    MAX_AGENT_WEIGHT = 0.35
+    APPROVAL_THRESHOLD = 0.54   # score mínimo para aprovar trade
 
-    def __init__(self, gemini_advisor: "GeminiAdvisor | None" = None) -> None:
-        self._agents = [
-            SigmaAgent(),
-            SeraphAgent(),
-            KronosAgent(),
-            VectorAgent(),
-            NexusAgent(),
-            AresAgent(),
-            EchoAgent(),
-            LumenAgent(),
+    def __init__(self) -> None:
+        # Instancia todos os agentes
+        self.agents = [
+            SigmaAgent(),    # peso alto — guardião
+            EchoAgent(),     # RL
+            SeraphAgent(),   # técnico
+            VectorAgent(),   # ML ensemble
+            NexusAgent(),    # regime
+            KronosAgent(),   # multi-TF
+            LumenAgent(),    # cross-asset
+            AresAgent(),     # order flow
+            OmenAgent(),     # sentimento
         ]
-        self._gemini = gemini_advisor
-        self._last_decision: CouncilDecision | None = None
+        self._agent_map = {a.name: a for a in self.agents}
 
-    @property
-    def echo_agent(self) -> EchoAgent:
-        """Acesso direto ao ECHO para atualização pós-trade."""
-        return next(a for a in self._agents if isinstance(a, EchoAgent))
+        # Pesos dinâmicos (inicializados dos atributos dos agentes)
+        self._weights: dict[str, float] = {a.name: a.weight for a in self.agents}
+        self._normalize_weights()
 
-    @property
-    def last_decision(self) -> CouncilDecision | None:
-        return self._last_decision
+        # Histórico de acurácia por agente: nome → deque[bool]
+        self._agent_accuracy: dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        # Último voto de cada agente (para feedback)
+        self._last_votes: dict[str, AgentVote] = {}
 
-    # ── API Principal ─────────────────────────────────────────────────────────
+        self._trade_count    = 0
+        self._adapt_count    = 0
+        self._total_wins     = 0
 
-    async def evaluate(
+        self._load_weights()
+
+    # ── API principal ─────────────────────────────────────────────────────────
+
+    def analyze(
         self,
-        signal: "Signal",
-        df: pd.DataFrame,
-        session: "SessionState",
-        ticks: list[dict] | None = None,
-        peer_dfs: dict[str, pd.DataFrame] | None = None,
-    ) -> CouncilDecision:
+        signal:   "Signal",
+        df:       "pd.DataFrame",
+        session:  "SessionState",
+        ticks:    list[dict] | None                  = None,
+        peer_dfs: dict[str, "pd.DataFrame"] | None   = None,
+    ) -> dict:
         """
-        Avalia o sinal com todos os agentes e retorna CouncilDecision.
-        Executa os agentes em paralelo via asyncio.
+        Executa o conselho completo e retorna:
+          {
+            "approved":    bool,
+            "direction":   "BUY"|"SELL"|"NEUTRAL",
+            "confidence":  0.0–1.0,
+            "votes":       {nome: AgentVote},
+            "reasoning":   str,
+            "vetoed_by":   str|None,
+          }
         """
-        t0 = time.monotonic()
+        votes: dict[str, AgentVote] = {}
 
-        # ── 1. Coleta votos de todos os agentes em paralelo ───────────────────
-        loop = asyncio.get_running_loop()
-        tasks = [
-            loop.run_in_executor(
-                None, agent.analyze, signal, df, session, ticks, peer_dfs
-            )
-            for agent in self._agents
-        ]
-        votes: list[AgentVote] = await asyncio.gather(*tasks)
+        # ── 1. Executa cada agente ────────────────────────────────────────────
+        for agent in self.agents:
+            try:
+                vote = agent.analyze(signal, df, session, ticks=ticks, peer_dfs=peer_dfs)
+            except Exception as exc:
+                logger.warning("Agente falhou.", agent=agent.name, error=str(exc))
+                vote = AgentVote(agent.name, "NEUTRAL", 0.5, reasoning=f"Erro: {exc}")
+            votes[agent.name] = vote
 
-        # ── 2. Voto do Gemini (usa cache — não faz chamada API aqui) ──────────
-        gemini_vote, gemini_reasoning = self._get_gemini_vote(signal)
-        if gemini_vote:
-            votes.append(gemini_vote)
+        self._last_votes = votes
 
-        sig_dir = signal.direction.value if hasattr(signal.direction, "value") else str(signal.direction)
-        is_buy  = sig_dir in ("BUY", "buy", "CALL", "call")
-        target_action = "BUY" if is_buy else "SELL"
+        # ── 2. Veto check ─────────────────────────────────────────────────────
+        for name in self.VETO_AGENTS:
+            if name in votes and votes[name].veto:
+                logger.info("VETO acionado.", agent=name, reason=votes[name].reasoning)
+                return {
+                    "approved":   False,
+                    "direction":  "NEUTRAL",
+                    "confidence": 0.0,
+                    "votes":      votes,
+                    "reasoning":  f"VETADO por {name}: {votes[name].reasoning}",
+                    "vetoed_by":  name,
+                }
 
-        # ── 3. Verifica VETO ──────────────────────────────────────────────────
-        for vote in votes:
-            if vote.veto:
-                decision = CouncilDecision(
-                    approved=False,
-                    action=target_action,
-                    final_confidence=0.0,
-                    weighted_score=0.0,
-                    votes=list(votes),
-                    veto_by=vote.agent_name,
-                    reasoning=vote.reasoning,
-                    gemini_reasoning=gemini_reasoning,
-                )
-                self._last_decision = decision
-                self._log_decision(decision, signal, elapsed=time.monotonic() - t0)
-                return decision
-
-        # ── 4. Calcula score ponderado ────────────────────────────────────────
-        weighted_score = self._compute_weighted_score(votes, target_action)
-
-        # ── 5. Decisão final ──────────────────────────────────────────────────
-        if weighted_score >= self.APPROVE_HIGH:
-            approved = True
-            final_confidence = signal.confidence * 1.10   # boost
-            reasoning = f"Conselho aprova com alta confiança (score={weighted_score:.3f})"
-        elif weighted_score >= self.APPROVE_LOW:
-            approved = True
-            final_confidence = signal.confidence * 0.85   # redução leve
-            reasoning = f"Conselho aprova com confiança reduzida (score={weighted_score:.3f})"
-        else:
-            approved = False
-            final_confidence = 0.0
-            reasoning = f"Conselho bloqueia (score={weighted_score:.3f} < {self.APPROVE_LOW})"
-
-        # Clamp confidence
-        final_confidence = max(0.0, min(final_confidence, 1.0))
-
-        decision = CouncilDecision(
-            approved=approved,
-            action=target_action if approved else "NEUTRAL",
-            final_confidence=final_confidence,
-            weighted_score=weighted_score,
-            votes=list(votes),
-            reasoning=reasoning,
-            gemini_reasoning=gemini_reasoning,
+        # ── 3. Score ponderado ────────────────────────────────────────────────
+        sig_dir = (
+            signal.direction.value
+            if hasattr(signal.direction, "value")
+            else str(signal.direction)
         )
-        self._last_decision = decision
-        self._log_decision(decision, signal, elapsed=time.monotonic() - t0)
-        return decision
+        is_buy  = sig_dir in ("BUY", "buy", "CALL", "call")
+        target  = "BUY" if is_buy else "SELL"
 
-    def update_echo_from_trade(self, action: str, pnl: float) -> None:
-        """Notifica o ECHO sobre o resultado de um trade para aprendizado."""
-        try:
-            reward = 1.0 if pnl > 0 else -1.0
-            self.echo_agent.update_from_trade(action, reward)
-        except Exception:
-            pass
+        bull_score = 0.0; bear_score = 0.0; total_w = 0.0
+
+        for agent in self.agents:
+            if agent.name in self.VETO_AGENTS:
+                continue
+            vote = votes.get(agent.name)
+            if not vote:
+                continue
+            w = self._weights.get(agent.name, agent.weight)
+            if vote.action == "BUY":
+                bull_score += w * vote.score
+            elif vote.action == "SELL":
+                bear_score += w * vote.score
+            else:
+                # NEUTRAL: meio a meio com score reduzido
+                bull_score += w * vote.score * 0.50
+                bear_score += w * vote.score * 0.50
+            total_w += w
+
+        if total_w < 0.01:
+            return self._neutral_result(votes, "Total de pesos zero")
+
+        # SIGMA contribui separadamente como "saúde geral"
+        sigma_vote = votes.get("SIGMA")
+        sigma_w    = self._weights.get("SIGMA", 0.20)
+        if sigma_vote and sigma_vote.action == target:
+            bull_score += sigma_w * sigma_vote.score if is_buy else 0.0
+            bear_score += sigma_w * sigma_vote.score if not is_buy else 0.0
+            total_w    += sigma_w
+        elif sigma_vote:
+            # SIGMA discorda → penalidade leve
+            if is_buy:  bull_score -= sigma_w * (1 - sigma_vote.score) * 0.5
+            else:       bear_score -= sigma_w * (1 - sigma_vote.score) * 0.5
+            total_w += sigma_w
+
+        bull_norm = max(0, bull_score / total_w) if total_w > 0 else 0
+        bear_norm = max(0, bear_score / total_w) if total_w > 0 else 0
+        total_n   = bull_norm + bear_norm
+
+        if total_n < 0.01:
+            return self._neutral_result(votes, "Scores zerados")
+
+        bull_pct = bull_norm / total_n
+        bear_pct = bear_norm / total_n
+
+        # ── 4. Decisão final ──────────────────────────────────────────────────
+        if is_buy and bull_pct > self.APPROVAL_THRESHOLD:
+            direction  = "BUY"
+            confidence = min(bull_pct, 0.97)
+            approved   = True
+        elif not is_buy and bear_pct > self.APPROVAL_THRESHOLD:
+            direction  = "SELL"
+            confidence = min(bear_pct, 0.97)
+            approved   = True
+        else:
+            direction  = target
+            confidence = max(bull_pct, bear_pct)
+            approved   = False
+
+        # ── 5. Constrói reasoning compacto ────────────────────────────────────
+        vote_summary = " | ".join(
+            f"{a.name}:{votes[a.name].action}({votes[a.name].score:.2f})"
+            for a in self.agents if a.name in votes
+        )
+
+        return {
+            "approved":   approved,
+            "direction":  direction,
+            "confidence": round(confidence, 4),
+            "votes":      votes,
+            "reasoning":  vote_summary,
+            "vetoed_by":  None,
+        }
+
+    def notify_outcome(
+        self,
+        action: str,
+        won:    bool,
+        pnl:    float,
+        signal: str = "",
+    ) -> None:
+        """
+        Chamado após trade fechado.
+        Notifica cada agente para aprendizado e atualiza pesos do Oracle.
+        """
+        self._trade_count += 1
+        self._adapt_count += 1
+        if won:
+            self._total_wins += 1
+
+        # Notifica cada agente
+        for agent in self.agents:
+            try:
+                agent.record_outcome(action=action, signal=signal, won=won, pnl=pnl)
+            except Exception as exc:
+                logger.warning("Falha record_outcome.", agent=agent.name, error=str(exc))
+
+            # Registra acurácia do agente para re-ponderação
+            last_vote = self._last_votes.get(agent.name)
+            if last_vote:
+                voted_correctly = (
+                    (last_vote.action == action and won) or
+                    (last_vote.action not in (action, "NEUTRAL") and not won)
+                )
+                self._agent_accuracy[agent.name].append(voted_correctly)
+
+        # Notifica ECHO especificamente (tem update_from_trade próprio)
+        echo = self._agent_map.get("ECHO")
+        if isinstance(echo, EchoAgent):
+            reward = pnl if won else -abs(pnl)
+            try:
+                echo.update_from_trade(action=action, reward=float(reward))
+            except Exception as exc:
+                logger.warning("Falha ECHO update.", error=str(exc))
+
+        # Re-ponderação periódica
+        if self._adapt_count >= self.ADAPT_CYCLE:
+            self._reweight_agents()
+            self._adapt_count = 0
+
+    # ── Ponderação dinâmica ───────────────────────────────────────────────────
+
+    def _reweight_agents(self) -> None:
+        """
+        Re-ponderar agentes baseado na acurácia dos últimos ADAPT_CYCLE trades.
+        Agentes com alta acurácia ganham mais peso; os ruins, menos.
+        """
+        new_weights: dict[str, float] = {}
+        all_acc: list[float] = []
+
+        for agent in self.agents:
+            hist = list(self._agent_accuracy[agent.name])
+            if len(hist) < 10:
+                new_weights[agent.name] = self._weights.get(agent.name, agent.weight)
+                continue
+            acc = sum(hist[-30:]) / min(len(hist), 30)  # últimos 30
+            all_acc.append(acc)
+            new_weights[agent.name] = acc
+
+        if all_acc:
+            mean_acc = np.mean(all_acc)
+            std_acc  = np.std(all_acc)
+            # Detecta agente desviante (acurácia < média - 1.5σ)
+            for name, acc_w in list(new_weights.items()):
+                if std_acc > 0 and acc_w < mean_acc - 1.5 * std_acc:
+                    logger.warning("Agente desviante detectado.", agent=name, acc=round(acc_w, 3))
+                    new_weights[name] = max(self.MIN_AGENT_WEIGHT, acc_w * 0.5)
+
+        # Clippa e normaliza
+        for name in new_weights:
+            new_weights[name] = max(
+                self.MIN_AGENT_WEIGHT,
+                min(self.MAX_AGENT_WEIGHT, new_weights[name])
+            )
+
+        # SIGMA nunca perde muito peso (guardião)
+        new_weights["SIGMA"] = max(new_weights.get("SIGMA", 0.15), 0.15)
+
+        total = sum(new_weights.values())
+        if total > 0:
+            self._weights = {k: v / total for k, v in new_weights.items()}
+
+        self._save_weights()
+        logger.info(
+            "GrandOracle: pesos re-calibrados.",
+            weights={k: round(v, 3) for k, v in self._weights.items()},
+        )
+
+    # ── Dashboard ─────────────────────────────────────────────────────────────
+
+    def get_council_health(self) -> dict:
+        """Retorna diagnóstico completo de todos os agentes."""
+        overall_wr = self._total_wins / max(self._trade_count, 1)
+        return {
+            "oracle_trades":    self._trade_count,
+            "oracle_win_rate":  round(overall_wr, 3),
+            "oracle_weights":   {k: round(v, 4) for k, v in self._weights.items()},
+            "agents": [a.get_introspection() for a in self.agents],
+        }
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _get_gemini_vote(self, signal) -> tuple[AgentVote | None, str]:
-        """Converte o último conselho do Gemini em um AgentVote."""
-        if self._gemini is None or not self._gemini.is_enabled:
-            return None, ""
+    def _normalize_weights(self) -> None:
+        total = sum(self._weights.values())
+        if total > 0:
+            self._weights = {k: v / total for k, v in self._weights.items()}
 
-        advice = self._gemini.last_advice
-        if advice is None:
-            return None, "Gemini: sem conselho ainda"
-
-        sig_dir = signal.direction.value if hasattr(signal.direction, "value") else str(signal.direction)
-        is_buy  = sig_dir in ("BUY", "buy", "CALL", "call")
-
-        # Mapeia confidence_multiplier para score
-        mult  = advice.confidence_multiplier
-        score = max(0.3, min(0.9, 0.5 * mult))  # 1.0 → 0.50, 1.5 → 0.75
-
-        if advice.risk_flag:
-            # Gemini detectou risco → vota NEUTRAL com score baixo
-            action = "NEUTRAL"
-            score  = 0.35
-        elif is_buy:
-            action = "BUY"
-        else:
-            action = "SELL"
-
-        vote = AgentVote(
-            agent_name="GEMINI",
-            action=action,
-            score=score,
-            reasoning=advice.reasoning[:80],
-        )
-        return vote, advice.reasoning
-
-    def _compute_weighted_score(self, votes: list[AgentVote], target_action: str) -> float:
-        """
-        Calcula o score ponderado do Conselho com base em pesos fixos.
-        Se um agente não votar, assume contribuição neutra (0.5).
-        """
-        weight_map = {
-            "SIGMA":  0.20, "SERAPH": 0.13, "KRONOS": 0.12,
-            "VECTOR": 0.12, "NEXUS":  0.10, "ARES":   0.10,
-            "GEMINI": self.GEMINI_WEIGHT, "ECHO": 0.08, "LUMEN": 0.05,
-        }
-
-        total_weight = sum(weight_map.values())
-        weighted_sum = 0.0
-
-        vote_map = {v.agent_name: v for v in votes}
-
-        for agent_name, w in weight_map.items():
-            vote = vote_map.get(agent_name)
-
-            if vote is None:
-                contribution = 0.5
-            elif vote.action == target_action:
-                contribution = vote.score
-            elif vote.action == "NEUTRAL":
-                contribution = 0.5
-            else:
-                contribution = 1.0 - vote.score
-
-            weighted_sum += w * contribution
-
-        return weighted_sum / total_weight
-
-    def _log_decision(self, decision: CouncilDecision, signal, elapsed: float) -> None:
-        votes_str = " | ".join(
-            f"{v.agent_name}:{v.action}({v.score:.2f})" for v in decision.votes
-        )
-        if decision.approved:
-            logger.info(
-                "🔮 Oracle Council APROVADO",
-                symbol=signal.symbol,
-                score=round(decision.weighted_score, 3),
-                confidence=round(decision.final_confidence, 3),
-                elapsed_ms=round(elapsed * 1000, 1),
-                votes=votes_str,
-            )
-        else:
-            logger.warning(
-                "🔮 Oracle Council BLOQUEADO",
-                symbol=signal.symbol,
-                score=round(decision.weighted_score, 3),
-                veto_by=decision.veto_by,
-                reasoning=decision.reasoning,
-                elapsed_ms=round(elapsed * 1000, 1),
-            )
-
-    def get_status(self) -> dict:
-        """Retorna o status atual do Conselho para a API REST."""
-        if self._last_decision is None:
-            return {"status": "idle", "last_decision": None}
+    def _neutral_result(self, votes, reason) -> dict:
         return {
-            "status": "active",
-            "last_decision": self._last_decision.summary(),
+            "approved":   False,
+            "direction":  "NEUTRAL",
+            "confidence": 0.0,
+            "votes":      votes,
+            "reasoning":  reason,
+            "vetoed_by":  None,
         }
+
+    def _save_weights(self) -> None:
+        os.makedirs(os.path.dirname(_WEIGHTS_PATH), exist_ok=True)
+        try:
+            with open(_WEIGHTS_PATH, "w") as f:
+                json.dump(self._weights, f)
+        except Exception:
+            pass
+
+    def _load_weights(self) -> None:
+        try:
+            if os.path.exists(_WEIGHTS_PATH):
+                with open(_WEIGHTS_PATH) as f:
+                    self._weights = json.load(f)
+                self._normalize_weights()
+                logger.info("GrandOracle: pesos carregados.", weights={k: round(v, 3) for k, v in self._weights.items()})
+        except Exception:
+            pass

@@ -37,7 +37,13 @@ async def bootstrap() -> None:
     FeatureCache.initialize(maxsize=2048)
     logger.success("Cache in-memory inicializado.")
 
-    # 5. Prometheus (opcional — não bloqueia se não instalado).
+    # 5. Groq Engine
+    from ml.groq_engine import get_groq_engine
+    if settings.groq_api_keys:
+        get_groq_engine(api_keys=settings.groq_api_keys)
+        logger.info("Groq Engine inicializado.", keys=len(settings.groq_api_keys))
+
+    # 6. Prometheus (opcional — não bloqueia se não instalado).
     _start_metrics_server(settings)
 
     logger.success("Bootstrap concluído. Sistema pronto.")
