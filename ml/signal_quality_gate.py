@@ -206,7 +206,7 @@ class SignalQualityGate:
                 return aligned, score
             # Fallback: close vs SMA20
             if "close" in df.columns and len(df) >= 20:
-                sma20 = float(df["close"].tail(20).mean())
+                sma20 = df["close"].tail(20).mean()
                 last  = float(df["close"].iloc[-1])
                 up    = last > sma20
                 aligned = (is_buy and up) or (not is_buy and not up)
@@ -274,7 +274,7 @@ class SignalQualityGate:
             if vol_col is None:
                 return True, 0.60  # sem volume disponível → ignora check
             vol_now  = float(df[vol_col].iloc[-1])
-            vol_mean = float(df[vol_col].tail(20).mean())
+            vol_mean = df[vol_col].tail(20).mean()
             if vol_mean <= 0:
                 return True, 0.60
             ratio = vol_now / vol_mean
