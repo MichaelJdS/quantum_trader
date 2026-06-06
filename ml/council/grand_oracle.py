@@ -128,7 +128,7 @@ class GrandOracle:
         t0 = time.monotonic()
 
         # ── 1. Coleta votos de todos os agentes em paralelo ───────────────────
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         tasks = [
             loop.run_in_executor(
                 None, agent.analyze, signal, df, session, ticks, peer_dfs
@@ -219,7 +219,7 @@ class GrandOracle:
         is_buy  = sig_dir in ("BUY", "buy", "CALL", "call")
 
         # Mapeia confidence_multiplier para score
-        mult  = float(advice.confidence_multiplier)
+        mult  = advice.confidence_multiplier
         score = max(0.3, min(0.9, 0.5 * mult))  # 1.0 → 0.50, 1.5 → 0.75
 
         if advice.risk_flag:
@@ -241,35 +241,35 @@ class GrandOracle:
 
     def _compute_weighted_score(self, votes: list[AgentVote], target_action: str) -> float:
         """
-        Calcula o score ponderado do Conselho.
-        Votos alinhados ao sinal somam positivamente.
-        Votos contrários penalizam.
-        Votos NEUTRAL têm penalidade leve.
+        Calcula o score ponderado do Conselho com base em pesos fixos.
+        Se um agente não votar, assume contribuição neutra (0.5).
         """
-        # Mapa de pesos por agente
         weight_map = {
             "SIGMA":  0.20, "SERAPH": 0.13, "KRONOS": 0.12,
             "VECTOR": 0.12, "NEXUS":  0.10, "ARES":   0.10,
             "GEMINI": self.GEMINI_WEIGHT, "ECHO": 0.08, "LUMEN": 0.05,
         }
 
-        total_weight = 0.0
+        total_weight = sum(weight_map.values())
         weighted_sum = 0.0
 
-        for vote in votes:
-            w = weight_map.get(vote.agent_name, 0.05)
-            total_weight += w
+        vote_map = {v.agent_name: v for v in votes}
 
-            if vote.action == target_action:
-                contribution = vote.score             # alinhado → positivo
+        for agent_name, w in weight_map.items():
+            vote = vote_map.get(agent_name)
+
+            if vote is None:
+                contribution = 0.5
+            elif vote.action == target_action:
+                contribution = vote.score
             elif vote.action == "NEUTRAL":
-                contribution = 0.5                    # neutro → 0.5 (não penaliza nem ajuda)
+                contribution = 0.5
             else:
-                contribution = 1.0 - vote.score       # contrário → penaliza pela confiança
+                contribution = 1.0 - vote.score
 
             weighted_sum += w * contribution
 
-        return weighted_sum / total_weight if total_weight > 0 else 0.5
+        return weighted_sum / total_weight
 
     def _log_decision(self, decision: CouncilDecision, signal, elapsed: float) -> None:
         votes_str = " | ".join(

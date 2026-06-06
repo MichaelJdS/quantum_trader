@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -25,11 +26,15 @@ class RiskManager:
 
     config: RiskConfig
     initial_balance: float
-    _trades: list[Trade] = field(default_factory=list, repr=False)
+
+    # FIX: deque(maxlen=N) ao invés de list — pop(0) era O(n)
+    _trades: deque[Trade] = field(default_factory=lambda: deque(maxlen=10_000), repr=False)
+
     # FIX B11: datetime.utcnow() deprecated desde Python 3.12 — usa aware datetime.
     _session_start: datetime = field(
         default_factory=lambda: datetime.now(tz=timezone.utc), repr=False
     )
+
     # FIX B8: high water mark real da sessão para cálculo correto de drawdown.
     _peak_balance: float = field(default=0.0, init=False, repr=False)
 
@@ -48,14 +53,13 @@ class RiskManager:
         Calcula o stake ideal de acordo com o modo configurado.
 
         Args:
-            current_balance: Saldo atual da conta.
-            win_probability: Probabilidade de ganho (necessário para Kelly).
+            current_balance:  Saldo atual da conta.
+            win_probability:  Probabilidade de ganho (necessário para Kelly).
             payout_multiplier: Multiplicador de payout do contrato.
 
         Returns:
             Stake calculado, respeitando limites de exposição.
         """
-        # FIX B2: Adicionado case para StakeMode.FRACTIONAL_KELLY e StakeMode.FRACTIONAL.
         match self.config.stake_mode:
             case StakeMode.FIXED:
                 stake = self.config.base_stake
@@ -67,23 +71,26 @@ class RiskManager:
                     )
                     stake = self.config.base_stake
                 else:
-                    stake = self._kelly_stake(
+                    result = self._kelly_stake(
                         current_balance, win_probability, payout_multiplier,
                         fraction=1.0,
                     )
+                    # FIX: Kelly pode retornar None se payout inválido
+                    stake = result if result is not None else self.config.base_stake
 
             case StakeMode.FRACTIONAL_KELLY:
-                # FIX B2: Antes esse case não existia — causava UnboundLocalError.
                 if win_probability is None:
                     logger.warning(
                         "Fractional Kelly solicitado sem probabilidade — fallback para FIXED."
                     )
                     stake = self.config.base_stake
                 else:
-                    stake = self._kelly_stake(
+                    result = self._kelly_stake(
                         current_balance, win_probability, payout_multiplier,
                         fraction=self.config.kelly_fraction,
                     )
+                    # FIX: Kelly pode retornar None se payout inválido
+                    stake = result if result is not None else self.config.base_stake
 
             case StakeMode.FRACTIONAL:
                 stake = current_balance * self.config.kelly_fraction
@@ -127,11 +134,37 @@ class RiskManager:
         p: float,
         payout: float,
         fraction: float = 1.0,
-    ) -> float:
-        """Kelly Criterion com fração configurável: f* = (bp - q) / b * fraction."""
+    ) -> float | None:
+        """
+        Kelly Criterion com fração configurável: f* = (bp - q) / b * fraction.
+
+        Retorna None se o payout for inválido (≤ 1.0), para que o caller
+        possa fallback para stake base explicitamente.
+
+        Args:
+            balance:  Saldo atual.
+            p:        Probabilidade de ganho (0.0 – 1.0).
+            payout:   Multiplicador do payout do contrato (ex: 1.95).
+            fraction: Fração de Kelly a aplicar (ex: 0.25 para Fractional Kelly).
+
+        Returns:
+            Stake calculado ou None se payout ≤ 1.0.
+        """
         b = payout - 1.0
+
+        # FIX: b ≤ 0 significa payout igual ou menor que o stake (inviável).
+        # Antes, retornava 0.0 silenciosamente, gerando stake zerado sem aviso.
+        if b <= 0:
+            logger.warning(
+                "Payout inválido para Kelly Criterion — não é possível calcular stake. "
+                "Verifique o contrato selecionado ou use modo FIXED.",
+                payout=payout,
+                b=b,
+            )
+            return None
+
         q = 1.0 - p
-        kelly_full = (b * p - q) / b if b > 0 else 0.0
+        kelly_full = (b * p - q) / b
         kelly_frac = max(kelly_full, 0.0) * fraction
         return balance * kelly_frac
 
@@ -193,7 +226,7 @@ class RiskManager:
     # ── Registro de Trades ────────────────────────────────────────────────────
 
     def register_trade(self, trade: Trade) -> None:
-        """Adiciona trade ao histórico interno e atualiza peak de saldo."""
+        """Adiciona trade ao histórico interno."""
         self._trades.append(trade)
 
     def update_peak(self, current_balance: float) -> None:
@@ -204,32 +237,57 @@ class RiskManager:
     # ── Métricas ──────────────────────────────────────────────────────────────
 
     def session_metrics(self, session: SessionState) -> dict[str, float]:
-        """Retorna métricas da sessão em formato serializável."""
-        pnls = [t.pnl for t in self._trades]
+        """
+        Retorna métricas da sessão em formato serializável.
+
+        Notas metodológicas:
+          - sharpe_per_trade: Ratio de Sharpe calculado por trade (não anualizado
+            por 252 dias), pois o bot opera intraday em granularidades de ticks/minutos.
+            Anualizar por sqrt(252) seria estatisticamente incorreto aqui.
+          - profit_factor: soma dos ganhos / soma das perdas (absoluto).
+            Retorna inf se não houver perdas (proteção vs ZeroDivisionError).
+        """
+        trades_list = list(self._trades)
+        pnls = [t.pnl for t in trades_list]
         wins = [p for p in pnls if p > 0]
         losses_list = [p for p in pnls if p <= 0]
 
         win_rate = len(wins) / len(pnls) if pnls else 0.0
+
         profit_factor = (
-            sum(wins) / abs(sum(losses_list)) if losses_list else float("inf")
+            sum(wins) / abs(sum(losses_list))
+            if losses_list and sum(losses_list) != 0
+            else float("inf")
         )
+
         avg_pnl = sum(pnls) / len(pnls) if pnls else 0.0
+
+        # FIX: Desvio-padrão amostral (n-1) ao invés de populacional (n),
+        # pois estamos estimando a partir de uma amostra de trades — não da
+        # distribuição completa.
         pnl_std = (
-            math.sqrt(sum((p - avg_pnl) ** 2 for p in pnls) / len(pnls))
+            math.sqrt(
+                sum((p - avg_pnl) ** 2 for p in pnls) / (len(pnls) - 1)
+            )
             if len(pnls) > 1
             else 0.0
         )
-        sharpe = (avg_pnl / pnl_std) * math.sqrt(252) if pnl_std > 0 else 0.0
+
+        # FIX: Sharpe por trade — não anualizado.
+        # Usar sqrt(252) aqui seria incorreto pois as "observações" são trades,
+        # não retornos diários. Se quiser anualização futura, passe o número de
+        # trades por dia como parâmetro e use sqrt(trades_por_ano).
+        sharpe_per_trade = (avg_pnl / pnl_std) if pnl_std > 0 else 0.0
 
         return {
-            "total_trades": len(pnls),
-            "win_rate": round(win_rate, 4),
-            "profit_factor": round(profit_factor, 4),
-            "pnl_total": round(sum(pnls), 4),
-            "pnl_avg": round(avg_pnl, 4),
-            "sharpe_ratio": round(sharpe, 4),
-            "max_drawdown_pct": round(self._daily_drawdown(session), 4),
-            "consecutive_losses": self._count_consecutive_losses(),
+            "total_trades":        len(pnls),
+            "win_rate":            round(win_rate, 4),
+            "profit_factor":       round(profit_factor, 4),
+            "pnl_total":           round(sum(pnls), 4),
+            "pnl_avg":             round(avg_pnl, 4),
+            "sharpe_per_trade":    round(sharpe_per_trade, 4),
+            "max_drawdown_pct":    round(self._daily_drawdown(session), 4),
+            "consecutive_losses":  self._count_consecutive_losses(),
         }
 
     # ── Helpers Privados ──────────────────────────────────────────────────────

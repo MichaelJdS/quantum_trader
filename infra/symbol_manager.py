@@ -1,383 +1,272 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import pandas as pd
 from loguru import logger
 
-from core.entities import SymbolConfig
-from core.exceptions import SymbolNotSupportedError
-from core.settings import get_settings
-from infra.deriv_client import DerivClient, MessageCallback
-from infra.db.database import get_session
-from infra.db.repository import CandleRepository, TickRepository
+from infra.deriv_client import DerivClient
 
+TickCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
-# ── Dados de tick ao vivo por símbolo ─────────────────────────────────────────
 
 @dataclass
 class SymbolState:
-    """Estado em tempo real de um símbolo."""
-
-    config: SymbolConfig
-    last_price: float = 0.0
-    last_epoch: int = 0
-    tick_count: int = 0
-    recent_ticks: list[dict] = field(default_factory=list)  # Armazena os últimos N ticks para análise (ARES)
+    symbol: str
     candles_df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    is_ready: bool = False  # True após carga inicial de candles.
+    recent_ticks: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=500))
+    tick_listeners: list[TickCallback] = field(default_factory=list)
+    is_ready: bool = False
+    last_tick_epoch: int | None = None
+    last_candle_epoch: int | None = None
 
-
-# ── Symbol Manager ────────────────────────────────────────────────────────────
 
 class SymbolManager:
     """
-    Gerencia múltiplos símbolos simultaneamente.
-
-    Responsabilidades:
-      - Carregar candles históricos de todos os símbolos no início.
-      - Manter stream de ticks ativos via WebSocket.
-      - Atualizar DataFrame de candles ao vivo.
-      - Persistir ticks e candles no banco de dados.
-      - Notificar listeners externos sobre novos ticks/candles.
-      - Fornecer acesso thread-safe ao estado de cada símbolo.
+    Responsável por:
+      - carregar candles iniciais de cada símbolo
+      - manter estado em memória por símbolo
+      - assinar ticks em tempo real
+      - expor DataFrame de candles e ticks recentes
     """
-
-    # Símbolos suportados pela plataforma Deriv (Volatility Index).
-    SUPPORTED_SYMBOLS: frozenset[str] = frozenset({
-        "R_10", "R_25", "R_50", "R_75", "R_100",
-        "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
-        "V10", "V25", "V50", "V75", "V100",
-        "BOOM300N", "BOOM500", "BOOM1000",
-        "CRASH300N", "CRASH500", "CRASH1000",
-        "STPRNG",
-    })
 
     def __init__(
         self,
         client: DerivClient,
-        symbols: list[str] | None = None,
-        granularity: int | None = None,
+        symbols: list[str],
+        granularity: int = 60,
+        candle_count: int = 500,
     ) -> None:
-        settings = get_settings()
         self._client = client
-        self._granularity = granularity or settings.default_granularity
-        self._states: dict[str, SymbolState] = {}
-        self._tick_listeners: dict[str, list[MessageCallback]] = defaultdict(list)
-        self._candle_listeners: dict[str, list[MessageCallback]] = defaultdict(list)
+        self._symbols = list(dict.fromkeys(symbols))
+        self._granularity = granularity
+        self._candle_count = max(100, min(candle_count, 5000))
+        self._states: dict[str, SymbolState] = {
+            symbol: SymbolState(symbol=symbol) for symbol in self._symbols
+        }
         self._lock = asyncio.Lock()
-        # FIX B13: Flag para garantir que o callback global de tick é registrado
-        # apenas uma vez, independente de reconexões.
-        self._tick_handler_registered: bool = False
+        self._initialized = False
 
-        raw_symbols = symbols or settings.symbols_list
-        for sym in raw_symbols:
-            self._register_symbol(sym)
-
-    # ── Setup ─────────────────────────────────────────────────────────────────
-
-    def _register_symbol(self, symbol: str) -> None:
-        """Valida e registra símbolo para tracking."""
-        if symbol not in self.SUPPORTED_SYMBOLS:
-            logger.warning(
-                "Símbolo não reconhecido na lista padrão — prosseguindo mesmo assim.",
-                symbol=symbol,
-            )
-        self._states[symbol] = SymbolState(
-            config=SymbolConfig(
-                name=symbol,
-                granularity=self._granularity,
-            )
-        )
-        logger.debug("Símbolo registrado.", symbol=symbol)
+    # ── Inicialização ─────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
         """
-        Inicializa todos os símbolos em paralelo:
-          1. Carrega candles históricos do banco (se existirem).
-          2. Busca candles frescos da API Deriv.
-          3. Inicia subscriptions de ticks.
+        Carrega candles históricos e registra subscriptions de ticks.
         """
-        logger.info(
-            "Inicializando SymbolManager.",
-            symbols=list(self._states.keys()),
-            granularity=self._granularity,
-        )
+        if self._initialized:
+            return
 
-        tasks = [
-            self._initialize_symbol(symbol)
-            for symbol in self._states
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for symbol in self._symbols:
+            await self._initialize_symbol(symbol)
 
-        for symbol, result in zip(self._states.keys(), results):
-            if isinstance(result, Exception):
-                logger.error(
-                    "Falha ao inicializar símbolo.",
-                    symbol=symbol,
-                    error=str(result),
-                )
-
-        ready_count = sum(1 for s in self._states.values() if s.is_ready)
+        self._initialized = True
         logger.success(
             "SymbolManager inicializado.",
-            ready=ready_count,
-            total=len(self._states),
+            symbols=self.ready_symbols,
+            granularity=self._granularity,
         )
 
     async def _initialize_symbol(self, symbol: str) -> None:
-        """Inicialização de um símbolo individual."""
-        state = self._states[symbol]
-
-        # 1. Carrega candles da API (necessário para as estratégias funcionarem).
-        candles = await self._client.get_candles(
-            symbol=symbol,
-            granularity=self._granularity,
-            count=500,
-        )
-
-        if candles:
-            state.candles_df = self._candles_to_df(candles)
-            state.is_ready = True
-            logger.info(
-                "Candles carregados.",
-                symbol=symbol,
-                count=len(candles),
-            )
-
-            # 2. Persiste candles no banco (best-effort — não bloqueia o início).
-            try:
-                async with get_session() as db:
-                    repo = CandleRepository(db)
-                    await repo.bulk_upsert(symbol, self._granularity, candles)
-            except Exception as exc:
-                logger.warning(
-                    "Não foi possível persistir candles no banco (não crítico).",
-                    symbol=symbol,
-                    error=str(exc),
-                )
-        else:
-            logger.warning(
-                "Nenhum candle retornado pela API — símbolo pode estar inativo.",
-                symbol=symbol,
-            )
-
-        # 3. Subscribe a ticks ao vivo (best-effort — falha não impede operação).
-        # O ExecutionEngine possui um polling loop que atualiza as velas
-        # periodicamente caso a subscription falhe.
         try:
-            await self._client.subscribe_ticks(
+            candles = await self._client.get_candles(
                 symbol=symbol,
-                callback=None,
+                granularity=self._granularity,
+                count=self._candle_count,
             )
-            # FIX B13: Registra o handler global de tick apenas uma vez.
-            if not self._tick_handler_registered:
-                self._client.on("tick", self._handle_tick)
-                self._tick_handler_registered = True
-            logger.info("Subscription de ticks ativa.", symbol=symbol)
+            df = self._candles_to_df(candles)
+
+            async with self._lock:
+                state = self._states[symbol]
+                state.candles_df = df
+                state.is_ready = not df.empty
+                if not df.empty:
+                    state.last_candle_epoch = int(df.iloc[-1]["epoch"])
+
+            await self._client.subscribe_ticks(symbol, callback=self._handle_tick)
+
+            logger.info(
+                "Símbolo inicializado.",
+                symbol=symbol,
+                candles=len(df),
+                ready=not df.empty,
+            )
         except Exception as exc:
-            logger.warning(
-                "Falha ao subscrever ticks — usando modo polling.",
+            logger.exception(
+                "Falha ao inicializar símbolo.",
                 symbol=symbol,
                 error=str(exc),
             )
 
-    # ── Handlers ──────────────────────────────────────────────────────────────
+    # ── Tick stream ───────────────────────────────────────────────────────────
 
     async def _handle_tick(self, data: dict[str, Any]) -> None:
         """
-        Callback chamado para cada tick recebido.
+        Callback único para todos os ticks da Deriv.
 
-        Atualiza estado do símbolo, persiste no banco e notifica listeners.
+        Formato esperado:
+          {
+            "msg_type": "tick",
+            "tick": {
+              "symbol": "R_50",
+              "quote": 123.45,
+              "epoch": 1710000000,
+              ...
+            }
+          }
         """
         tick = data.get("tick", {})
-        symbol: str = tick.get("symbol", "")
-
-        if symbol not in self._states:
+        symbol = tick.get("symbol")
+        if not symbol or symbol not in self._states:
             return
 
-        # FIX B12: Índices sintéticos da Deriv (Volatility Index) retornam
-        # o preço no campo "quote", não em "ask"/"bid" (que ficam vazios).
-        # Fallback para ask/bid mantém compatibilidade com outros tipos de ativo.
-        price_raw = tick.get("quote") or tick.get("ask") or tick.get("bid") or 0.0
-        price = float(price_raw)
-        epoch = int(tick.get("epoch", 0))
-        pip_size = tick.get("pip_size")
+        normalized_tick = {
+            "symbol": symbol,
+            "price": self._extract_tick_price(tick),
+            "epoch": int(tick.get("epoch", 0)),
+            "raw": tick,
+        }
 
-        if price == 0.0:
-            logger.warning(
-                "Tick recebido com preço zero — descartado.",
-                symbol=symbol,
-                tick=tick,
-            )
-            return
-
-        # FIX B3: tick_count lido DENTRO do lock para evitar race condition.
-        should_persist = False
         async with self._lock:
             state = self._states[symbol]
-            state.last_price = price
-            state.last_epoch = epoch
-            state.tick_count += 1
-            
-            # Mantém os últimos 60 ticks na memória para o ARES agent
-            state.recent_ticks.append(tick)
-            if len(state.recent_ticks) > 60:
-                state.recent_ticks.pop(0)
 
-            # Atualiza último candle do DataFrame com o preço atual.
-            self._update_live_candle(state, price, epoch)
+            # Evita duplicidade exata do mesmo tick
+            if state.last_tick_epoch == normalized_tick["epoch"]:
+                return
 
-            # Determina se deve persistir (dentro do lock para consistência).
-            should_persist = state.tick_count % 100 == 0
+            state.last_tick_epoch = normalized_tick["epoch"]
+            state.recent_ticks.append(normalized_tick)
 
-        # Persiste tick no banco (batch a cada 100 ticks por símbolo).
-        if should_persist:
-            asyncio.create_task(
-                self._persist_ticks(symbol, [{"symbol": symbol, "price": price,
-                                               "epoch": epoch, "pip_size": pip_size}])
-            )
+            listeners = list(state.tick_listeners)
 
-        # Notifica listeners externos.
-        for listener in self._tick_listeners.get(symbol, []):
-            asyncio.create_task(listener(data))
+        # Fora do lock para não bloquear o pipeline
+        for cb in listeners:
+            try:
+                await cb(normalized_tick)
+            except Exception as exc:
+                logger.exception(
+                    "Tick listener falhou.",
+                    symbol=symbol,
+                    error=str(exc),
+                )
 
-        logger.trace(
-            "Tick recebido.",
-            symbol=symbol,
-            price=price,
-            epoch=epoch,
+    def _extract_tick_price(self, tick: dict[str, Any]) -> float:
+        quote = tick.get("quote")
+        if quote is None:
+            return 0.0
+        try:
+            return float(quote)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # ── Candles ───────────────────────────────────────────────────────────────
+
+    def _candles_to_df(self, candles: list[dict[str, Any]]) -> pd.DataFrame:
+        """
+        Converte lista de candles da Deriv em DataFrame padronizado.
+
+        Espera itens no formato:
+          {"epoch": 123, "open": "...", "high": "...", "low": "...", "close": "..."}
+        """
+        if not candles:
+            return pd.DataFrame(columns=["epoch", "open", "high", "low", "close"])
+
+        df = pd.DataFrame(candles).copy()
+
+        required = ["epoch", "open", "high", "low", "close"]
+        for col in required:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        df = df[required]
+
+        for col in required:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=required)
+
+        if df.empty:
+            return pd.DataFrame(columns=required)
+
+        df = (
+            df.sort_values("epoch")
+            .drop_duplicates(subset=["epoch"], keep="last")
+            .reset_index(drop=True)
         )
 
-    def _update_live_candle(
-        self,
-        state: SymbolState,
-        price: float,
-        epoch: int,
-    ) -> None:
+        # Sanidade OHLC
+        df = df[
+            (df["high"] >= df["low"])
+            & (df["high"] >= df[["open", "close"]].max(axis=1))
+            & (df["low"] <= df[["open", "close"]].min(axis=1))
+        ].reset_index(drop=True)
+
+        return df
+
+    async def refresh_symbol(self, symbol: str) -> None:
         """
-        Atualiza o high/low/close do candle atual.
-        Cria novo candle quando a janela de tempo encerrou.
+        Recarrega candles completos para um símbolo.
+        Útil após reconexão ou se detectar staleness.
         """
-        if state.candles_df.empty:
+        candles = await self._client.get_candles(
+            symbol=symbol,
+            granularity=self._granularity,
+            count=self._candle_count,
+        )
+        df = self._candles_to_df(candles)
+
+        async with self._lock:
+            state = self._states[symbol]
+            state.candles_df = df
+            state.is_ready = not df.empty
+            state.last_candle_epoch = int(df.iloc[-1]["epoch"]) if not df.empty else None
+
+        logger.info(
+            "Símbolo atualizado.",
+            symbol=symbol,
+            candles=len(df),
+            ready=not df.empty,
+        )
+
+    # ── Listeners ─────────────────────────────────────────────────────────────
+
+    def add_tick_listener(self, symbol: str, callback: TickCallback) -> None:
+        if symbol not in self._states:
+            raise ValueError(f"Símbolo não gerenciado: {symbol}")
+
+        state = self._states[symbol]
+        if callback not in state.tick_listeners:
+            state.tick_listeners.append(callback)
+
+    def remove_tick_listener(self, symbol: str, callback: TickCallback) -> None:
+        if symbol not in self._states:
             return
 
-        last_epoch = int(state.candles_df.iloc[-1]["epoch"])
-        candle_end = last_epoch + self._granularity
+        state = self._states[symbol]
+        state.tick_listeners = [cb for cb in state.tick_listeners if cb is not callback]
 
-        if epoch >= candle_end:
-            # Novo candle.
-            new_row = pd.DataFrame([{
-                "open": price, "high": price,
-                "low": price, "close": price,
-                "epoch": epoch,
-            }])
-            state.candles_df = pd.concat(
-                [state.candles_df, new_row], ignore_index=True
-            ).tail(1000)  # Mantém apenas últimos 1000 candles em memória.
-        else:
-            # Atualiza candle corrente.
-            idx = len(state.candles_df) - 1
-            state.candles_df.at[idx, "close"] = price
-            state.candles_df.at[idx, "high"] = max(
-                float(state.candles_df.at[idx, "high"]), price  # type: ignore
-            )
-            state.candles_df.at[idx, "low"] = min(
-                float(state.candles_df.at[idx, "low"]), price  # type: ignore
-            )
-
-    # ── Persistência ──────────────────────────────────────────────────────────
-
-    async def _persist_ticks(
-        self,
-        symbol: str,
-        ticks: list[dict],
-    ) -> None:
-        try:
-            async with get_session() as db:
-                repo = TickRepository(db)
-                await repo.bulk_save(ticks)
-        except Exception as exc:
-            logger.error("Falha ao persistir ticks.", symbol=symbol, error=str(exc))
-
-    # ── API Pública ───────────────────────────────────────────────────────────
+    # ── Leitura de estado ─────────────────────────────────────────────────────
 
     def get_candles_df(self, symbol: str) -> pd.DataFrame:
-        """Retorna o DataFrame atualizado de candles do símbolo (thread-safe)."""
         state = self._states.get(symbol)
-        if not state or state.candles_df.empty:
-            return pd.DataFrame()
+        if state is None or state.candles_df.empty:
+            return pd.DataFrame(columns=["epoch", "open", "high", "low", "close"])
         return state.candles_df.copy()
 
-    def get_recent_ticks(self, symbol: str) -> list[dict]:
-        """Retorna a lista de ticks recentes para análise de microestrutura."""
+    def get_recent_ticks(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
         state = self._states.get(symbol)
-        if not state:
+        if state is None:
             return []
-        return list(state.recent_ticks)
-
-    def get_last_price(self, symbol: str) -> float:
-        """Retorna último preço recebido do símbolo."""
-        if symbol not in self._states:
-            raise SymbolNotSupportedError(f"Símbolo não registrado: {symbol}")
-        return self._states[symbol].last_price
-
-    def is_symbol_ready(self, symbol: str) -> bool:
-        """True se símbolo tem candles carregados e está operacional."""
-        return self._states.get(symbol, SymbolState(
-            config=SymbolConfig(name=symbol)
-        )).is_ready
-
-    def add_tick_listener(self, symbol: str, callback: MessageCallback) -> None:
-        """Registra callback para ticks de um símbolo específico."""
-        self._tick_listeners[symbol].append(callback)
-
-    def remove_tick_listener(self, symbol: str, callback: MessageCallback) -> None:
-        self._tick_listeners[symbol] = [
-            cb for cb in self._tick_listeners[symbol] if cb is not callback
-        ]
-
-    async def add_symbol(self, symbol: str) -> None:
-        """Adiciona e inicializa um novo símbolo em runtime."""
-        if symbol in self._states:
-            logger.warning("Símbolo já registrado.", symbol=symbol)
-            return
-        self._register_symbol(symbol)
-        await self._initialize_symbol(symbol)
-
-    async def remove_symbol(self, symbol: str) -> None:
-        """Remove símbolo e cancela sua subscription."""
-        if symbol not in self._states:
-            return
-        await self._client.unsubscribe_ticks(symbol)
-        self._states.pop(symbol)
-        logger.info("Símbolo removido.", symbol=symbol)
-
-    async def shutdown(self) -> None:
-        """Cancela todas as subscriptions e libera recursos."""
-        await self._client.unsubscribe_all()
-        logger.info("SymbolManager encerrado.")
-
-    @property
-    def symbols(self) -> list[str]:
-        return list(self._states.keys())
+        if limit <= 0:
+            return list(state.recent_ticks)
+        return list(state.recent_ticks)[-limit:]
 
     @property
     def ready_symbols(self) -> list[str]:
-        return [s for s, state in self._states.items() if state.is_ready]
+        return [symbol for symbol, state in self._states.items() if state.is_ready]
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _candles_to_df(candles: list[dict]) -> pd.DataFrame:
-        """Converte lista de candles da API para DataFrame tipado."""
-        df = pd.DataFrame(candles)
-        for col in ("open", "high", "low", "close"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
-        df.sort_values("epoch", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
+    @property
+    def symbols(self) -> list[str]:
+        return list(self._symbols)

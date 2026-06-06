@@ -148,6 +148,8 @@ class DerivClient:
         self._rate_limiter: RateLimiter = RateLimiter(rate=40)  # 40/s: margem segura
         self._listen_task: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnecting = False
 
     # ── Conexão ───────────────────────────────────────────────────────────────
 
@@ -304,17 +306,31 @@ class DerivClient:
 
     async def _reconnect(self) -> None:
         """Tenta reconectar após queda."""
-        logger.info("Iniciando reconexão...")
-        self._authorized = False
-        await asyncio.sleep(2)
-        try:
-            await self.connect()
-            # Re-inscreve em todos os símbolos ativos.
-            for symbol in list(self._subscriptions.keys()):
-                self._subscriptions.pop(symbol, None)
-                await self.subscribe_ticks(symbol)
-        except DerivConnectionError as exc:
-            logger.error("Reconexão falhou.", error=str(exc))
+        async with self._reconnect_lock:
+            if self._reconnecting:
+                return
+            self._reconnecting = True
+            try:
+                logger.info("Iniciando reconexão...")
+                self._authorized = False
+
+                if self._listen_task and not self._listen_task.done():
+                    self._listen_task.cancel()
+                if self._ping_task and not self._ping_task.done():
+                    self._ping_task.cancel()
+
+                await asyncio.sleep(2)
+                await self.connect()
+
+                active_symbols = list(self._subscriptions.keys())
+                self._subscriptions.clear()
+                for symbol in active_symbols:
+                    await self.subscribe_ticks(symbol)
+
+            except DerivConnectionError as exc:
+                logger.error("Reconexão falhou.", error=str(exc))
+            finally:
+                self._reconnecting = False
 
     # ── Envio de Mensagens ────────────────────────────────────────────────────
 
@@ -347,9 +363,9 @@ class DerivClient:
 
         try:
             return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
-        except TimeoutError:
+        except asyncio.TimeoutError as exc:
             self._pending.pop(self._req_id, None)
-            raise TimeoutError(f"Timeout ({timeout}s) aguardando resposta. payload={payload}")
+            raise TimeoutError(f"Timeout ({timeout}s) aguardando resposta. payload={payload}") from exc
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -508,7 +524,7 @@ class DerivClient:
         duration_unit: str,
         amount: float,
         basis: str = "stake",
-        currency: str = "USD",
+        currency: str | None = None,
     ) -> dict:
         """
         Obtém cotação de contrato antes de comprar.
@@ -522,6 +538,10 @@ class DerivClient:
             basis: "stake" ou "payout".
             currency: Moeda da conta.
         """
+        if currency is None:
+            balance = await self.get_balance()
+            currency = balance.get("currency", "USD")
+
         response = await self._send_raw(
             {
                 "proposal": 1,

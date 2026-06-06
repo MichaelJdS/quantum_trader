@@ -61,6 +61,12 @@ class ExecutionEngine:
     _feature_engineer: FeatureEngineer = field(init=False)
     _session_state: SessionState = field(init=False)
     _open_trades: dict[str, Trade] = field(default_factory=dict, init=False)
+    _symbol_locks: dict[str, asyncio.Lock] = field(
+        default_factory=dict, init=False
+    )
+    _last_processed_epoch: dict[str, int] = field(
+        default_factory=dict, init=False
+    )
     # FIX B9: Mantém referência forte às tasks para evitar GC prematuro.
     _pending_tasks: set[asyncio.Task] = field(default_factory=set, init=False)
     # FIX C1: Mapa de contract_id → Future para receber resultado live.
@@ -83,9 +89,18 @@ class ExecutionEngine:
             current_balance=0.0,
         )
         self._gemini_risk_flag: bool = False
+        self._symbol_locks = {}
+        self._last_processed_epoch = {}
         # Inicializa o Grand Oracle com referência ao Gemini
         if self.grand_oracle is None:
             self.grand_oracle = GrandOracle(gemini_advisor=self.gemini_advisor)
+
+    def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
+        lock = self._symbol_locks.get(symbol)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._symbol_locks[symbol] = lock
+        return lock
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -113,22 +128,22 @@ class ExecutionEngine:
             current_balance=balance,
         )
 
-        for symbol in self.symbol_manager.ready_symbols:
-            self.symbol_manager.add_tick_listener(
-                symbol,
-                self._make_tick_handler(symbol),
-            )
+        # Removemos tick listeners para evitar duplicação de pipeline
+        # e confiamos apenas no polling baseado em candles.
 
         # FIX C1: Registra listener para resultados reais de contratos (modo live).
         if not self.dry_run:
             self.client.on("proposal_open_contract", self._handle_contract_update)
-            asyncio.create_task(self.client.subscribe_open_contracts())
+            task = asyncio.create_task(
+                self.client.subscribe_open_contracts(),
+                name="subscribe_open_contracts",
+            )
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
 
         self._running = True
 
-        # Inicia polling loop: baixa velas frescas e roda estratégias a cada 10s.
-        # Não depende de subscriptions WebSocket de ticks.
-        poll_task = asyncio.create_task(self._polling_loop())
+        poll_task = asyncio.create_task(self._polling_loop(), name="engine_polling")
         self._pending_tasks.add(poll_task)
         poll_task.add_done_callback(self._pending_tasks.discard)
 
@@ -260,106 +275,114 @@ class ExecutionEngine:
         logger.info("Polling loop encerrado.")
 
     async def _process_symbol(self, symbol: str) -> None:
-        """Pipeline completo para um símbolo em um tick."""
+        """Pipeline completo para um símbolo em um tick/ciclo de polling."""
         
-        # 0. Ignora se já houver um trade aberto para este símbolo
-        if any(t.symbol == symbol for t in self._open_trades.values()):
-            return
+        lock = self._get_symbol_lock(symbol)
+        async with lock:
+            # 0. Ignora se já houver um trade aberto para este símbolo
+            if any(t.symbol == symbol for t in self._open_trades.values()):
+                return
 
-        # 1. Candles + features.
-        raw_df = self.symbol_manager.get_candles_df(symbol)
-        if raw_df.empty or len(raw_df) < 55:
-            return
+            # 1. Candles + features.
+            raw_df = self.symbol_manager.get_candles_df(symbol)
+            if raw_df.empty or len(raw_df) < 55:
+                return
 
-        cache = FeatureCache.get_instance()
-        cached_df = cache.get_features(symbol, "features_df")
-        last_epoch = int(raw_df.iloc[-1]["epoch"])
+            last_epoch = int(raw_df.iloc[-1]["epoch"])
+            prev_epoch = self._last_processed_epoch.get(symbol)
+            if prev_epoch == last_epoch:
+                # Já processamos este candle mais recente; evita duplicidade
+                return
+            self._last_processed_epoch[symbol] = last_epoch
 
-        # FIX B17: Invalida por epoch E por TTL (evita cache stale pós-reconexão).
-        if (
-            cached_df is not None
-            and int(cached_df.iloc[-1].get("epoch", 0)) == last_epoch
-            and not cache.is_expired(symbol, "features_df", ttl_seconds=30)
-        ):
-            feat_df = cached_df
-        else:
-            feat_df = self._feature_engineer.compute(raw_df)
-            cache.set_features(symbol, "features_df", feat_df)
+            cache = FeatureCache.get_instance()
+            cached_df = cache.get_features(symbol, "features_df")
 
-        if feat_df.empty:
-            return
+            # FIX B17: Invalida por epoch E por TTL (evita cache stale pós-reconexão).
+            if (
+                cached_df is not None
+                and int(cached_df.iloc[-1].get("epoch", 0)) == last_epoch
+                and not cache.is_expired(symbol, "features_df", ttl_seconds=30)
+            ):
+                feat_df = cached_df
+            else:
+                feat_df = self._feature_engineer.compute(raw_df)
+                cache.set_features(symbol, "features_df", feat_df)
 
-        # 2. Consulta Gemini Advisor (se disponível e for hora de consultar).
-        await self._consult_gemini(feat_df, symbol)
+            if feat_df.empty:
+                return
 
-        # 3. Ordena estratégias: Gemini prioriza uma delas movendo-a para frente.
-        strategies = self._get_ordered_strategies()
+            # 2. Consulta Gemini Advisor (se disponível e for hora de consultar).
+            await self._consult_gemini(feat_df, symbol)
 
-        # 4. Avalia cada estratégia (com possível ajuste de confiança do Gemini).
-        for strategy in strategies:
-            signal = strategy.generate_signal(feat_df, symbol, self._session_state)
-            if signal is None:
-                continue
+            # 3. Ordena estratégias: Gemini prioriza uma delas movendo-a para frente.
+            strategies = self._get_ordered_strategies()
 
-            # Aplica o multiplicador de confiança do Gemini
-            if self._gemini_confidence_mult != 1.0:
-                signal = Signal(
-                    symbol=signal.symbol,
-                    direction=signal.direction,
-                    confidence=min(1.0, signal.confidence * self._gemini_confidence_mult),
-                    strategy_name=signal.strategy_name,
-                    model_name=signal.model_name,
-                    contract_type=signal.contract_type,
-                    entry_price=signal.entry_price,
-                )
+            # 4. Avalia cada estratégia (com possível ajuste de confiança do Gemini).
+            for strategy in strategies:
+                signal = strategy.generate_signal(feat_df, symbol, self._session_state)
+                if signal is None:
+                    continue
 
-            # ── Oracle Council: votação dos 8 especialistas ──────────────────
-            if self.grand_oracle is not None:
-                # Coleta DataFrames dos outros símbolos para LUMEN
-                peer_dfs = {
-                    s: self._feature_engineer.compute(
-                        self.symbol_manager.get_candles_df(s)
+                # Aplica o multiplicador de confiança do Gemini
+                if self._gemini_confidence_mult != 1.0:
+                    signal = Signal(
+                        symbol=signal.symbol,
+                        direction=signal.direction,
+                        confidence=min(1.0, signal.confidence * self._gemini_confidence_mult),
+                        strategy_name=signal.strategy_name,
+                        model_name=signal.model_name,
+                        contract_type=signal.contract_type,
+                        entry_price=signal.entry_price,
                     )
-                    for s in self.symbol_manager.ready_symbols
-                    if s != symbol
-                }
-                peer_dfs = {s: df for s, df in peer_dfs.items() if not df.empty}
 
-                ticks = self.symbol_manager.get_recent_ticks(symbol)
-                decision = await self.grand_oracle.evaluate(
-                    signal=signal,
-                    df=feat_df,
-                    session=self._session_state,
-                    ticks=ticks,
-                    peer_dfs=peer_dfs or None,
-                )
+                # ── Oracle Council: votação dos 8 especialistas ──────────────────
+                if self.grand_oracle is not None:
+                    # Coleta DataFrames dos outros símbolos para LUMEN
+                    peer_dfs = {
+                        s: self._feature_engineer.compute(
+                            self.symbol_manager.get_candles_df(s)
+                        )
+                        for s in self.symbol_manager.ready_symbols
+                        if s != symbol
+                    }
+                    peer_dfs = {s: df for s, df in peer_dfs.items() if not df.empty}
 
-                # Broadcast do voto do Conselho para o dashboard
-                if self.broadcast_fn:
-                    await self.broadcast_fn("council_vote", decision.summary())
-
-                if not decision.approved:
-                    logger.info(
-                        "Oracle Council bloqueou o trade.",
-                        symbol=symbol,
-                        score=round(decision.weighted_score, 3),
-                        veto_by=decision.veto_by,
+                    ticks = self.symbol_manager.get_recent_ticks(symbol)
+                    decision = await self.grand_oracle.evaluate(
+                        signal=signal,
+                        df=feat_df,
+                        session=self._session_state,
+                        ticks=ticks,
+                        peer_dfs=peer_dfs or None,
                     )
-                    break
 
-                # Ajusta confiança do sinal com base na decisão do Conselho
-                signal = Signal(
-                    symbol=signal.symbol,
-                    direction=signal.direction,
-                    confidence=min(1.0, decision.final_confidence),
-                    strategy_name=signal.strategy_name,
-                    model_name=f"council({decision.weighted_score:.2f})",
-                    contract_type=signal.contract_type,
-                    entry_price=signal.entry_price,
-                )
+                    # Broadcast do voto do Conselho para o dashboard
+                    if self.broadcast_fn:
+                        await self.broadcast_fn("council_vote", decision.summary())
 
-            await self._handle_signal(signal)
-            break  # Uma operação por tick por símbolo.
+                    if not decision.approved:
+                        logger.info(
+                            "Oracle Council bloqueou o trade.",
+                            symbol=symbol,
+                            score=round(decision.weighted_score, 3),
+                            veto_by=decision.veto_by,
+                        )
+                        break
+
+                    # Ajusta confiança do sinal com base na decisão do Conselho
+                    signal = Signal(
+                        symbol=signal.symbol,
+                        direction=signal.direction,
+                        confidence=min(1.0, decision.final_confidence),
+                        strategy_name=signal.strategy_name,
+                        model_name=f"council({decision.weighted_score:.2f})",
+                        contract_type=signal.contract_type,
+                        entry_price=signal.entry_price,
+                    )
+
+                await self._handle_signal(signal)
+                break  # Uma operação por tick por símbolo.
 
     async def _consult_gemini(self, feat_df, symbol: str) -> None:
         """Consulta o Gemini Advisor e atualiza as prioridades/flags."""
@@ -543,114 +566,115 @@ class ExecutionEngine:
         Em dry-run: simula resultado com probabilidade baseada na confiança.
         Em live: aguarda evento `proposal_open_contract` via Future registrado.
         """
-        if self.dry_run:
-            # Simula latência do contrato.
-            await asyncio.sleep(5)
-            won = random.random() < trade.confidence
-            pnl = (expected_payout - trade.stake) if won else -trade.stake
-            status = TradeStatus.WON if won else TradeStatus.LOST
-            exit_price = trade.entry_price  # Simulado.
-        else:
-            won = False
-            # FIX C1: Aguarda resultado real via Future resolvido pelo listener
-            # de proposal_open_contract. Timeout de 120s evita espera infinita.
-            fut = self._contract_futures.get(contract_id)
-            if fut is None:
-                logger.error(
-                    "Future não encontrado para contrato live.",
-                    contract_id=contract_id,
-                    trade_id=trade.id,
-                )
-                return
-
-            try:
-                contract_data = await asyncio.wait_for(fut, timeout=120.0)
-                is_sold = contract_data.get("is_sold", 0)
-                profit = float(contract_data.get("profit", 0.0))
-                won = profit > 0
-                pnl = profit
+        try:
+            if self.dry_run:
+                await asyncio.sleep(5)
+                won = random.random() < trade.confidence
+                pnl = (expected_payout - trade.stake) if won else -trade.stake
                 status = TradeStatus.WON if won else TradeStatus.LOST
-                raw_exit = contract_data.get("exit_tick")
-                exit_price = float(raw_exit if raw_exit is not None else (trade.entry_price or 0.0))
-            except TimeoutError:
-                logger.error(
-                    "Timeout aguardando resultado do contrato live.",
-                    contract_id=contract_id,
+                exit_price = trade.entry_price
+            else:
+                fut = self._contract_futures.get(contract_id)
+                if fut is None:
+                    logger.error(
+                        "Future não encontrado para contrato live.",
+                        contract_id=contract_id,
+                        trade_id=trade.id,
+                    )
+                    return
+
+                try:
+                    contract_data = await asyncio.wait_for(fut, timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Timeout aguardando resultado do contrato live.",
+                        contract_id=contract_id,
+                        trade_id=trade.id,
+                    )
+                    status = TradeStatus.ERROR
+                    pnl = 0.0
+                    won = False
+                    exit_price = trade.entry_price
+                else:
+                    profit = float(contract_data.get("profit", 0.0))
+                    won = profit > 0
+                    pnl = profit
+                    status = TradeStatus.WON if won else TradeStatus.LOST
+                    raw_exit = contract_data.get("exit_tick")
+                    exit_price = float(raw_exit) if raw_exit is not None else (trade.entry_price or 0.0)
+
+            closed_at = datetime.now(tz=timezone.utc)
+
+            async with get_session() as db:
+                repo = TradeRepository(db)
+                await repo.update_result(
                     trade_id=trade.id,
+                    status=status,
+                    exit_price=exit_price,
+                    pnl=pnl,
+                    payout=expected_payout if won else None,
+                    closed_at=closed_at,
                 )
-                status = TradeStatus.ERROR
-                pnl = 0.0
-                exit_price = None
-                won = False
-            finally:
-                self._contract_futures.pop(contract_id, None)
 
-        closed_at = datetime.now(tz=timezone.utc)
+            self._session_state.current_balance += pnl
+            self._session_state.total_trades += 1
+            if pnl > 0:
+                self._session_state.wins += 1
+                self._session_state.consecutive_losses = 0
+            else:
+                self._session_state.losses += 1
+                self._session_state.consecutive_losses += 1
 
-        # Atualiza banco.
-        async with get_session() as db:
-            repo = TradeRepository(db)
-            await repo.update_result(
+            total = self._session_state.total_trades
+            self._session_state.win_rate = self._session_state.wins / total if total else 0.0
+
+            trade.pnl = pnl
+            trade.status = status
+            trade.closed_at = closed_at
+            self._risk_manager.register_trade(trade)
+            self._risk_manager.update_peak(self._session_state.current_balance)
+
+            self._strategy_results[trade.strategy_name].append(won)
+            if len(self._strategy_results[trade.strategy_name]) > 50:
+                self._strategy_results[trade.strategy_name].pop(0)
+
+            logger.info(
+                "Resultado do trade.",
                 trade_id=trade.id,
-                status=status,
-                exit_price=exit_price,
-                pnl=pnl,
-                payout=expected_payout if won else None,
-                closed_at=closed_at,
+                status=status.value,
+                pnl=round(pnl, 4),
+                balance=round(self._session_state.current_balance, 4),
+                win_rate=round(self._session_state.win_rate, 4),
             )
 
-        # Atualiza estado da sessão.
-        self._session_state.current_balance += pnl
-        self._session_state.total_trades += 1
-        if pnl > 0:
-            self._session_state.wins += 1
-            self._session_state.consecutive_losses = 0
-        else:
-            self._session_state.losses += 1
-            self._session_state.consecutive_losses += 1
+            if self.broadcast_fn:
+                await self.broadcast_fn("trade", {
+                    "trade_id": trade.id,
+                    "symbol": trade.symbol,
+                    "direction": trade.direction.value,
+                    "stake": trade.stake,
+                    "strategy": trade.strategy_name,
+                    "confidence": round(trade.confidence, 4),
+                    "pnl": round(pnl, 4),
+                    "status": status.value,
+                    "balance": round(self._session_state.current_balance, 4),
+                    "win_rate": round(self._session_state.win_rate, 4),
+                    "ts": closed_at.isoformat(),
+                })
 
-        total = self._session_state.total_trades
-        self._session_state.win_rate = self._session_state.wins / total if total else 0.0
-
-        # Registra no RiskManager e atualiza peak de saldo.
-        trade.pnl = pnl
-        trade.status = status
-        trade.closed_at = closed_at
-        self._risk_manager.register_trade(trade)
-        # FIX B8: Atualiza high water mark para cálculo correto de drawdown.
-        self._risk_manager.update_peak(self._session_state.current_balance)
-        self._open_trades.pop(trade.id, None)
-
-        # Atualiza histórico de resultados por estratégia (para o Gemini).
-        self._strategy_results[trade.strategy_name].append(won)
-        # Mantém apenas os últimos 50 resultados por estratégia.
-        if len(self._strategy_results[trade.strategy_name]) > 50:
-            self._strategy_results[trade.strategy_name].pop(0)
-
-        logger.info(
-            "Resultado do trade.",
-            trade_id=trade.id,
-            status=status.value,
-            pnl=round(pnl, 4),
-            balance=round(self._session_state.current_balance, 4),
-            win_rate=round(self._session_state.win_rate, 4),
-        )
-
-        # Broadcast do evento de trade via WebSocket (Cloud API).
-        if self.broadcast_fn:
-            await self.broadcast_fn("trade", {
-                "trade_id": trade.id,
-                "symbol": trade.symbol,
-                "direction": trade.direction.value,
-                "stake": trade.stake,
-                "strategy": trade.strategy_name,
-                "confidence": round(trade.confidence, 4),
-                "pnl": round(pnl, 4),
-                "status": status.value,
-                "balance": round(self._session_state.current_balance, 4),
-                "win_rate": round(self._session_state.win_rate, 4),
-                "ts": closed_at.isoformat(),
-            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Erro inesperado em _await_result.",
+                error=str(exc),
+                trade_id=trade.id,
+                contract_id=contract_id,
+            )
+        finally:
+            if contract_id:
+                self._contract_futures.pop(contract_id, None)
+            self._open_trades.pop(trade.id, None)
 
     # ── Listener de Contratos Live ────────────────────────────────────────────
 
