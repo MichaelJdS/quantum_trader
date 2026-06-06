@@ -417,7 +417,8 @@ class MainWindow(QMainWindow):
 
         def _start():
             try:
-                self._api_client.start_bot_sync(config)
+                if self._api_client is not None:
+                    self._api_client.start_bot_sync(config)
             except Exception as exc:
                 self._btn_start.setEnabled(True)
                 self._btn_start.setText("▶ Iniciar")
@@ -430,7 +431,8 @@ class MainWindow(QMainWindow):
 
         def _stop():
             try:
-                self._api_client.stop_bot_sync()
+                if self._api_client is not None:
+                    self._api_client.stop_bot_sync()
             except Exception as exc:
                 self._btn_stop.setEnabled(True)
                 self._btn_stop.setText("■ Parar")

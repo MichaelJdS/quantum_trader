@@ -148,7 +148,7 @@ class VectorAgent(BaseAgent):
 
         # 2. MACD
         macd = self._safe_float(last.get("macd_hist", 0.0))
-        macd_std = float(df["macd_hist"].std()) if "macd_hist" in df.columns else 0.001
+        macd_std = df["macd_hist"].std() if "macd_hist" in df.columns else 0.001
         raw["macd_momentum"] = macd / (macd_std + 1e-9)
         if macd_std > 0:
             norm = macd / (macd_std * 2 + 1e-9)
@@ -185,7 +185,7 @@ class VectorAgent(BaseAgent):
 
         # 5. Momentum 10
         if len(df) > 10:
-            c_now = float(df["close"].iloc[-1]); c_10 = float(df["close"].iloc[-11])
+            c_now = df["close"].iloc[-1]; c_10 = df["close"].iloc[-11]
             mom = (c_now / c_10 - 1) if c_10 else 0.0
         else:
             mom = 0.0
@@ -204,7 +204,7 @@ class VectorAgent(BaseAgent):
         # 7. Volume Delta (NOVO)
         if "volume" in df.columns and len(df) >= 20:
             vol_now  = self._safe_float(last.get("volume", 0))
-            vol_mean = float(df["volume"].tail(20).mean())
+            vol_mean = df["volume"].tail(20).mean()
             if vol_mean > 0:
                 vol_ratio = vol_now / vol_mean - 1.0  # >0 = volume acima da média
                 raw["volume_delta"] = vol_ratio

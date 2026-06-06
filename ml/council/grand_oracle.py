@@ -252,7 +252,7 @@ class GrandOracle:
         if isinstance(echo, EchoAgent):
             reward = pnl if won else -abs(pnl)
             try:
-                echo.update_from_trade(action=action, reward=float(reward))
+                echo.update_from_trade(action=action, reward=reward)
             except Exception as exc:
                 logger.warning("Falha ECHO update.", error=str(exc))
 
