@@ -47,6 +47,7 @@ class AppState:
     client = None
     symbol_manager = None
     gemini_advisor = None
+    groq_engine = None
     is_running: bool = False
     session_id: str = ""
     config: BotConfig | None = None
@@ -199,20 +200,40 @@ async def get_status():
 
 @app.post("/gemini/chat", response_model=ChatResponse, dependencies=[Depends(verify_token)])
 async def gemini_chat(req: ChatRequest):
-    """Chat livre com o Gemini Advisor — para o painel do App Windows."""
-    if state.gemini_advisor is None or not state.gemini_advisor.is_enabled:
-        raise HTTPException(status_code=503, detail="Gemini Advisor não está ativo.")
+    """Chat com o Advisor de IA — usa Groq (LLaMA) como backend."""
+    if state.groq_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Groq Advisor não ativo. Adicione GROQ_API_KEYS no .env.",
+        )
 
     context = ""
     if state.is_running and state.engine:
         s = state.engine.session_state
         context = (
-            f"[Contexto atual do bot]\n"
+            f"[Contexto do bot]\n"
             f"Saldo: ${s.current_balance:.2f} | Win Rate: {s.win_rate:.1%} | "
-            f"Trades: {s.total_trades} | Perdas consecutivas: {s.consecutive_losses}"
+            f"Trades: {s.total_trades} | Perdas consecutivas: {s.consecutive_losses}\n"
+            f"Modo: {'DRY-RUN' if state.engine.dry_run else 'AO VIVO'}"
         )
-    response = await state.gemini_advisor.chat(req.message, context=context)
-    return ChatResponse(message=response)
+
+    system_prompt = (
+        "Você é o Advisor de IA do Quantum Trader, bot de trading na Deriv. "
+        "Analise o mercado, explique estratégias (EMA+RSI, Bollinger, Breakout), "
+        "alerte riscos e responda dúvidas. Seja direto e use emojis. "
+        "Responda em português brasileiro.\n\n"
+        + (f"{context}\n\n" if context else "")
+    )
+
+    response = await state.groq_engine.complete(
+        system_prompt=system_prompt,
+        user_message=req.message,
+        max_tokens=600,
+        temperature=0.4,
+    )
+    if response is None:
+        raise HTTPException(status_code=503, detail="Groq não respondeu.")
+    return ChatResponse(message=response.content)
 
 
 @app.get("/council/status", dependencies=[Depends(verify_token)])
@@ -220,7 +241,7 @@ async def get_council_status():
     """Retorna o último status do Oracle Council."""
     if not state.is_running or state.engine is None or state.engine.grand_oracle is None:
         return {"status": "idle", "last_decision": None}
-    return state.engine.grand_oracle.get_status()
+    return state.engine.grand_oracle.get_council_health()
 
 
 @app.put("/config", response_model=CommandResponse, dependencies=[Depends(verify_token)])
@@ -289,7 +310,8 @@ async def _boot_engine(config: BotConfig) -> None:
     from core.strategies import BollingerReversionStrategy, BreakoutStrategy, EmaRsiStrategy
     from infra.deriv_client import DerivClient
     from infra.symbol_manager import SymbolManager
-    from ml.gemini_advisor import GeminiAdvisor
+    from core.settings import get_settings
+    from ml.groq_engine import GroqEngine
 
     risk_config = RiskConfig(
         stake_mode=StakeMode.FRACTIONAL_KELLY if getattr(config, "kelly_enabled", False) else StakeMode.FIXED,
@@ -311,7 +333,18 @@ async def _boot_engine(config: BotConfig) -> None:
     )
     await state.symbol_manager.initialize()
 
-    state.gemini_advisor = GeminiAdvisor()
+    settings = get_settings()
+
+    state.gemini_advisor = None
+    if settings.groq_api_keys:
+        state.groq_engine = GroqEngine(api_keys=settings.groq_api_keys)
+        logger.info("GroqEngine inicializado.", keys=len(settings.groq_api_keys))
+    else:
+        state.groq_engine = None
+        logger.warning("GROQ_API_KEYS não configurado — chat de IA desabilitado.")
+
+    from ml.council.grand_oracle import GrandOracle
+    grand_oracle = GrandOracle(groq_engine=state.groq_engine)
 
     state.engine = ExecutionEngine(
         client=state.client,
@@ -319,13 +352,29 @@ async def _boot_engine(config: BotConfig) -> None:
         risk_config=risk_config,
         session_id=state.session_id,
         dry_run=config.dry_run,
-        gemini_advisor=state.gemini_advisor,
+        gemini_advisor=None,
         broadcast_fn=state.broadcast,
+        grand_oracle=grand_oracle,
     )
 
     state.engine.register_strategy(EmaRsiStrategy(risk_config=risk_config))
     state.engine.register_strategy(BollingerReversionStrategy(risk_config=risk_config))
     state.engine.register_strategy(BreakoutStrategy(risk_config=risk_config))
+
+    from infra.historical_loader import HistoricalLoader
+    from ml.market_profiler import MarketProfiler
+
+    # Boot histórico inteligente
+    profiler = MarketProfiler()
+    loader   = HistoricalLoader(
+        client=state.client,
+        symbol_manager=state.symbol_manager,
+        profiler=profiler,
+    )
+    profiles = await loader.load_all()   # baixa tudo, perfia, decide
+
+    # Passa perfis ao engine
+    state.engine.set_symbol_profiles(profiles)
 
     await state.engine.start()
 

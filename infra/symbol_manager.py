@@ -85,7 +85,18 @@ class SymbolManager:
                 if not df.empty:
                     state.last_candle_epoch = int(df.iloc[-1]["epoch"])
 
-            await self._client.subscribe_ticks(symbol, callback=self._handle_tick)
+            import asyncio
+            for attempt in range(3):
+                try:
+                    await self._client.subscribe_ticks(symbol, callback=self._handle_tick)
+                    break
+                except TimeoutError:
+                    if attempt == 2:
+                        logger.error("Falha ao inicializar símbolo após 3 tentativas.", symbol=symbol)
+                        raise
+                    else:
+                        logger.warning(f"Timeout ao inscrever {symbol}, tentando novamente ({attempt+2}/3)...")
+                        await asyncio.sleep(2)
 
             logger.info(
                 "Símbolo inicializado.",
@@ -185,7 +196,7 @@ class SymbolManager:
         for col in required:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df = df.dropna(subset=required)
+        df = df.dropna(subset=required)  # type: ignore
 
         if df.empty:
             return pd.DataFrame(columns=required)

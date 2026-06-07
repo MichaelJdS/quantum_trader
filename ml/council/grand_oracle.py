@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from core.entities import SessionState, Signal
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 @dataclass
 class CouncilDecision:
@@ -90,9 +90,9 @@ class GrandOracle:
     MAX_AGENT_WEIGHT = 0.35
     APPROVAL_THRESHOLD = 0.54   # score mínimo para aprovar trade
 
-    def __init__(self) -> None:
+    def __init__(self, groq_engine=None) -> None:
         # Instancia todos os agentes
-        self.agents = [
+        self.agents: list[Any] = [
             SigmaAgent(),    # peso alto — guardião
             EchoAgent(),     # RL
             SeraphAgent(),   # técnico
@@ -103,6 +103,15 @@ class GrandOracle:
             AresAgent(),     # order flow
             OmenAgent(),     # sentimento
         ]
+        
+        if groq_engine is not None:
+            try:
+                from ml.council.agents.groq_agent import GroqAgent
+                self.agents.append(GroqAgent(groq_engine))
+                logger.info("GrandOracle v3.1: GroqAgent adicionado (★ 10º agente).")
+            except Exception as exc:
+                logger.warning("GroqAgent não pôde ser instanciado.", error=str(exc))
+
         self._agent_map = {a.name: a for a in self.agents}
 
         # Pesos dinâmicos (inicializados dos atributos dos agentes)
@@ -375,6 +384,7 @@ class GrandOracle:
             "oracle_trades":    self._trade_count,
             "oracle_win_rate":  round(overall_wr, 3),
             "oracle_weights":   {k: round(v, 4) for k, v in self._weights.items()},
+            "groq_in_council":  "GROQ" in self._agent_map,
             "agents": [a.get_introspection() for a in self.agents],
         }
 

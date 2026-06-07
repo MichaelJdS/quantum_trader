@@ -95,6 +95,20 @@ class ExecutionEngine:
         # Inicializa o Grand Oracle
         if self.grand_oracle is None:
             self.grand_oracle = GrandOracle()
+            
+        self._symbol_profiles: dict = {}   # symbol → SymbolProfile
+
+    def set_symbol_profiles(self, profiles: dict) -> None:
+        """Recebe perfis do HistoricalLoader após o boot."""
+        self._symbol_profiles = profiles
+        for sym, p in profiles.items():
+            logger.info(
+                "Perfil de símbolo aplicado.",
+                symbol=sym,
+                granularity=f"{p.granularity}s",
+                duration=f"{p.duration}{p.duration_unit}",
+                win_rate=f"{p.win_rate:.1%}",
+            )
 
     def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
         lock = self._symbol_locks.get(symbol)
@@ -496,8 +510,8 @@ class ExecutionEngine:
             proposal = await self.client.get_proposal(
                 symbol=signal.symbol,
                 contract_type=signal.contract_type.value,
-                duration=self._get_duration(signal.strategy_name),
-                duration_unit=self._get_duration_unit(signal.strategy_name),
+                duration=self._get_duration(signal.strategy_name, signal.symbol),
+                duration_unit=self._get_duration_unit(signal.strategy_name, signal.symbol),
                 amount=stake,
             )
         except Exception as exc:
@@ -763,22 +777,18 @@ class ExecutionEngine:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _get_duration(self, strategy_name: str) -> int:
-        durations = {
-            "ema_rsi_macd": 5,
-            "bollinger_reversion": 3,
-            "breakout_squeeze": 5,
-        }
-        return durations.get(strategy_name, 5)
+    def _get_duration(self, strategy_name: str, symbol: str = "") -> int:
+        profile = self._symbol_profiles.get(symbol)
+        if profile:
+            return profile.duration
+        # fallback por estratégia
+        return {"ema_rsi_macd": 5, "bollinger_reversion": 3, "breakout_squeeze": 5}.get(strategy_name, 5)
 
-    def _get_duration_unit(self, strategy_name: str) -> str:
-        # FIX B18: Implementado de verdade — cada estratégia pode ter unidade diferente.
-        units = {
-            "ema_rsi_macd": "t",        # Ticks.
-            "bollinger_reversion": "t", # Ticks.
-            "breakout_squeeze": "t",    # Ticks.
-        }
-        return units.get(strategy_name, "t")
+    def _get_duration_unit(self, strategy_name: str, symbol: str = "") -> str:
+        profile = self._symbol_profiles.get(symbol)
+        if profile:
+            return profile.duration_unit
+        return "t"
 
     # ── Propriedades ──────────────────────────────────────────────────────────
 

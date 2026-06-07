@@ -137,7 +137,7 @@ class DerivClient:
     def __init__(self, dry_run: bool = True) -> None:
         self._settings = get_settings()
         self._dry_run = dry_run
-        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._ws: Any = None
         self._req_id: int = 0
         self._pending: dict[int, asyncio.Future[dict]] = {}
         self._callbacks: dict[str, list[MessageCallback]] = {}
@@ -226,7 +226,7 @@ class DerivClient:
                 fut.cancel()
         self._pending.clear()
 
-        if self._ws and not self._ws.closed:
+        if self._ws and self._ws.close_code is None:
             await self._ws.close()
 
         logger.info("DerivClient desconectado.")
@@ -258,7 +258,7 @@ class DerivClient:
         while self._running:
             # FIX B4: Verifica se _ws ainda existe antes de chamar recv().
             # Durante reconexão, _ws pode ser None temporariamente.
-            if self._ws is None or self._ws.closed:
+            if self._ws is None or self._ws.close_code is not None:
                 logger.warning("_listen_loop: WebSocket indisponível — aguardando reconexão.")
                 await asyncio.sleep(0.5)
                 continue
@@ -402,7 +402,7 @@ class DerivClient:
 
         response = await self._send_raw(
             {"ticks": symbol, "subscribe": 1},
-            timeout=10.0,
+            timeout=20.0,
         )
         if "error" in response:
             raise DerivConnectionError(
@@ -622,7 +622,7 @@ class DerivClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and not self._ws.closed and self._authorized
+        return self._ws is not None and self._ws.close_code is None and self._authorized
 
     @property
     def is_dry_run(self) -> bool:

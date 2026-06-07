@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 # Importação condicional para não travar se a lib não estiver instalada
 try:
-    import google.genai as genai
+    import google.generativeai as genai
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False
@@ -65,7 +65,7 @@ class GeminiAdvisor:
     Configuração (via .env ou env vars):
         GEMINI_API_KEY  — chave da API do Google AI Studio (gratuita)
         GEMINI_MODEL    — modelo a usar (default: gemini-1.5-flash)
-        GEMINI_INTERVAL — intervalo mínimo entre consultas em segundos (default: 300)
+        GEMINI_CONSULT_INTERVAL_SECONDS — intervalo mínimo entre consultas em segundos (default: 300)
     """
 
     _SYSTEM_PROMPT = """\
@@ -89,7 +89,7 @@ Regras:
         _s = get_settings()
         self._api_key    = _s.gemini_api_key
         self._model_name = _s.gemini_model
-        self._interval   = _s.gemini_interval
+        self._interval   = _s.gemini_consult_interval_seconds
         self._last_consulted: float = 0.0
         self._last_advice: GeminiAdvice | None = None
         self._model = None
