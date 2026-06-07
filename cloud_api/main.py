@@ -129,7 +129,7 @@ async def start_bot(config: BotConfig):
         await state.broadcast("bot_started", {"session_id": state.session_id, "config": config.model_dump()})
         return CommandResponse(success=True, message=f"Bot iniciado. Session: {state.session_id}")
     except Exception as exc:
-        logger.error("Falha ao iniciar bot.", error=str(exc))
+        logger.exception("Falha ao iniciar bot.")
         raise HTTPException(status_code=500, detail=str(exc))
 
 

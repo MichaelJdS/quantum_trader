@@ -22,21 +22,9 @@ def mock_client():
 
 @pytest.mark.asyncio
 async def test_initialize_loads_candles(mock_client):
-    with patch("infra.symbol_manager.get_session"):
-        manager = SymbolManager(client=mock_client, symbols=["R_50"])
-        # Simula get_session como no-op.
-        with patch("infra.symbol_manager.CandleRepository") as mock_repo_cls:
-            mock_repo = AsyncMock()
-            mock_repo_cls.return_value = mock_repo
-            mock_repo.bulk_upsert = AsyncMock()
-
-            with patch("infra.symbol_manager.get_session") as mock_gs:
-                mock_ctx = AsyncMock()
-                mock_ctx.__aenter__ = AsyncMock(return_value=mock_repo)
-                mock_ctx.__aexit__ = AsyncMock(return_value=False)
-                mock_gs.return_value = mock_ctx
-
-                await manager.initialize()
+    manager = SymbolManager(client=mock_client, symbols=["R_50"])
+    
+    await manager.initialize()
 
     assert "R_50" in manager.ready_symbols
     df = manager.get_candles_df("R_50")

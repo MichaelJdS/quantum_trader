@@ -39,7 +39,7 @@ def configure_logging(settings: "Settings") -> None:
     )
 
     # ── Handler de arquivo (rotativo) ─────────────────────────────────────────
-    if settings.is_production or settings.app_env.value == "staging":
+    if settings.is_production or settings.environment == "staging":
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
         logger.add(
@@ -57,6 +57,6 @@ def configure_logging(settings: "Settings") -> None:
 
     logger.info(
         "Logging configurado",
-        env=settings.app_env.value,
+        env=settings.environment,
         level=settings.log_level,
     )

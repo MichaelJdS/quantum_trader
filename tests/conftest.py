@@ -6,7 +6,7 @@ import os
 import pytest
 
 # Força .env de teste para não usar credenciais reais.
-os.environ.setdefault("DERIV_APP_ID", "test_app_id")
+os.environ.setdefault("DERIV_APP_ID", "12345")
 os.environ.setdefault("DERIV_API_TOKEN", "test_token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test_quantum.db")
 os.environ.setdefault("APP_ENV", "development")

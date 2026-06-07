@@ -22,7 +22,7 @@ async def bootstrap() -> None:
 
     # 1. Logging deve ser o primeiro — tudo que vem depois usa o logger.
     configure_logging(settings)
-    logger.info("Bootstrap iniciado", app=settings.app_name, env=settings.app_env.value)
+    logger.info("Bootstrap iniciado", app=settings.app_name, env=settings.environment)
 
     # 2. Diretórios.
     _ensure_directories(settings)
@@ -54,7 +54,7 @@ def _ensure_directories(settings: "Settings") -> None:  # type: ignore[name-defi
     from core.settings import Settings
     s: Settings = settings
     dirs = [
-        Path(s.model_dir),
+        Path("models_store"),
         Path("logs"),
         Path("artifacts"),
     ]

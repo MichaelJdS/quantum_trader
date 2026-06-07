@@ -62,7 +62,7 @@ def test_feature_engineer_columns(feat_df):
     """Verifica que features essenciais são geradas."""
     essential = {
         "ema_9", "ema_21", "ema_50", "rsi_14", "macd_hist",
-        "adx", "bb_upper", "bb_lower", "atr_14", "squeeze",
+        "adx", "bb_upper", "bb_lower", "atr_14", "is_squeeze",
     }
     assert essential.issubset(set(feat_df.columns))
 

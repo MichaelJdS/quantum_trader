@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 # Importação condicional para não travar se a lib não estiver instalada
 try:
-    import google.generativeai as genai
+    import google.genai as genai
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False

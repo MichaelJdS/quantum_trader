@@ -373,7 +373,7 @@ class ExecutionEngine:
                     peer_dfs = {s: df for s, df in peer_dfs.items() if not df.empty}
 
                     ticks = self.symbol_manager.get_recent_ticks(symbol)
-                    decision = self.grand_oracle.analyze(
+                    decision = self.grand_oracle.decide(
                         signal=signal,
                         df=feat_df,
                         session=self._session_state,
@@ -383,7 +383,7 @@ class ExecutionEngine:
 
                     if self.broadcast_fn:
                         votes_list = []
-                        for v in decision.get("votes", {}).values():
+                        for v in decision.votes.values():
                             votes_list.append({
                                 "agent": v.agent_name,
                                 "action": v.action,
@@ -392,30 +392,30 @@ class ExecutionEngine:
                                 "reasoning": v.reasoning,
                             })
                         summary = {
-                            "approved": decision["approved"],
-                            "action": decision["direction"],
-                            "confidence": decision["confidence"],
-                            "veto_by": decision["vetoed_by"],
-                            "reasoning": decision["reasoning"],
+                            "approved": decision.approved,
+                            "action": decision.direction,
+                            "confidence": decision.confidence,
+                            "veto_by": decision.vetoed_by,
+                            "reasoning": decision.reasoning,
                             "votes": votes_list,
                         }
                         await self.broadcast_fn("council_vote", summary)
 
-                    if not decision["approved"]:
+                    if not decision.approved:
                         logger.info(
                             "Oracle Council bloqueou o trade.",
                             symbol=symbol,
-                            score=decision["confidence"],
-                            veto_by=decision["vetoed_by"],
+                            score=decision.confidence,
+                            veto_by=decision.vetoed_by,
                         )
                         break
 
                     signal = Signal(
                         symbol=signal.symbol,
                         direction=signal.direction,
-                        confidence=min(1.0, decision["confidence"]),
+                        confidence=min(1.0, decision.confidence),
                         strategy_name=signal.strategy_name,
-                        model_name=f"council({decision['confidence']:.2f})",
+                        model_name=f"council({decision.confidence:.2f})",
                         contract_type=signal.contract_type,
                         entry_price=signal.entry_price,
                     )

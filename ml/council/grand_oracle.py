@@ -34,6 +34,41 @@ if TYPE_CHECKING:
     import pandas as pd
     from core.entities import SessionState, Signal
 
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class CouncilDecision:
+    """
+    Decisão final do GrandOracle — compatibilidade com ExecutionEngine.
+    """
+    approved:    bool
+    direction:   str                        # "BUY" | "SELL" | "NEUTRAL"
+    confidence:  float                      # 0.0–1.0
+    vetoed_by:   Optional[str]  = None      # nome do agente que vetou, ou None
+    reasoning:   str            = ""
+    votes:       dict           = field(default_factory=dict)  # {nome: AgentVote}
+
+    # Helpers de compatibilidade
+    @property
+    def is_buy(self) -> bool:
+        return self.direction in ("BUY", "CALL", "buy", "call")
+
+    @property
+    def is_sell(self) -> bool:
+        return self.direction in ("SELL", "PUT", "sell", "put")
+
+    @property
+    def was_vetoed(self) -> bool:
+        return self.vetoed_by is not None
+
+    def __repr__(self) -> str:
+        veto = f" VETADO={self.vetoed_by}" if self.vetoed_by else ""
+        return (
+            f"CouncilDecision({self.direction} conf={self.confidence:.2f} "
+            f"approved={self.approved}{veto})"
+        )
+
 _WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "states", "oracle_weights.json")
 
 
@@ -214,6 +249,28 @@ class GrandOracle:
             "reasoning":  vote_summary,
             "vetoed_by":  None,
         }
+
+    def decide(
+        self,
+        signal:   "Signal",
+        df:       "pd.DataFrame",
+        session:  "SessionState",
+        ticks:    list[dict] | None                  = None,
+        peer_dfs: dict[str, "pd.DataFrame"] | None   = None,
+    ) -> CouncilDecision:
+        """
+        Wrapper que retorna CouncilDecision em vez de dict.
+        Usado pelo ExecutionEngine.
+        """
+        result = self.analyze(signal, df, session, ticks=ticks, peer_dfs=peer_dfs)
+        return CouncilDecision(
+            approved   = result["approved"],
+            direction  = result["direction"],
+            confidence = result["confidence"],
+            vetoed_by  = result.get("vetoed_by"),
+            reasoning  = result.get("reasoning", ""),
+            votes      = result.get("votes", {}),
+        )
 
     def notify_outcome(
         self,

@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     app_name: str = Field(default="Quantum Trader", alias="APP_NAME")
     environment: str = Field(default="development", alias="ENVIRONMENT")
     debug: bool = Field(default=False, alias="DEBUG")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # ── Deriv API ─────────────────────────────────────────────────────────────
     deriv_websocket_url: str = Field(
@@ -67,6 +68,7 @@ class Settings(BaseSettings):
     api_host: str = Field(default="127.0.0.1", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
+    prometheus_port: int = Field(default=9090, alias="PROMETHEUS_PORT")
 
     # ── Validators ────────────────────────────────────────────────────────────
 
