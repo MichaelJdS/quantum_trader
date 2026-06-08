@@ -170,7 +170,7 @@ class SymbolManager:
         await self._broadcast_tick(symbol, new_row["close"], new_row["epoch"])
         
         # Avisa o motor de execução instantaneamente
-        if hasattr(self, '_engine') and self._engine:
+        if hasattr(self, '_engine') and self._engine is not None:
             await self._engine._candle_queue.put((symbol, new_row))
 
     async def _broadcast_tick(self, symbol: str, price: float, epoch: int) -> None:

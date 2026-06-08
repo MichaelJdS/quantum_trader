@@ -71,10 +71,9 @@ class GeminiAdvisor:
 
     SYSTEM_INSTRUCTION = """
 Você é um analista quantitativo. Responda SEMPRE e SOMENTE com JSON válido.
-Nunca adicione texto, markdown, blocos de código ou explicações fora do JSON.
 Formato obrigatório:
 {
-  "recommended_strategy": "BUY" | "SELL" | "NEUTRAL",
+  "recommended_strategy": "<nome exato de uma das estratégias disponíveis>",
   "confidence_multiplier": <float entre 0.5 e 1.5>,
   "risk_flag": <true | false>,
   "reasoning": "<máximo 100 caracteres>"
@@ -209,13 +208,15 @@ Formato obrigatório:
             f"Últimos Candles (OHLCV resumido):\n{ctx.candles_summary}\n\n"
             f"Indicadores Técnicos:\n{json.dumps(ctx.indicators, indent=2)}\n\n"
             f"Estado da Sessão:\n{json.dumps(ctx.session_state_summary, indent=2)}\n\n"
-            f"Estratégias disponíveis: {ctx.available_strategies}\n\n"
+            f"Estratégias disponíveis (use exatamente um desses nomes): {ctx.available_strategies}\n\n"
             f"Resultados recentes por estratégia:\n{json.dumps(ctx.last_strategy_results, indent=2)}\n\n"
-            "Analise e retorne o JSON de recomendação."
+            "Analise e retorne o JSON de recomendação.\n\n"
+            "IMPORTANTE: Responda APENAS com o objeto JSON, sem texto antes ou depois, sem markdown, sem blocos de código."
         )
 
     def _parse_response(self, raw: str, available: list[str]) -> GeminiAdvice:
         """Faz parsing do JSON retornado pelo Gemini com fallback seguro."""
+        logger.debug(f"GEMINI RAW RESPONSE: >>>{raw}<<<")
         import re
 
         clean = raw.replace("```json", "").replace("```", "").strip()

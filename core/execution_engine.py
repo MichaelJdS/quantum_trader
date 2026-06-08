@@ -92,6 +92,7 @@ class ExecutionEngine:
             current_balance=0.0,
         )
         self._gemini_risk_flag: bool = False
+        self._processing_symbols: set[str] = set()
         self._symbol_locks = {}
         self._last_processed_epoch = {}
         # Inicializa o Grand Oracle
@@ -339,169 +340,172 @@ class ExecutionEngine:
     async def _process_symbol(self, symbol: str) -> None:
         """Pipeline completo para um símbolo em um tick/ciclo de polling."""
         
+        if symbol in self._processing_symbols:
+            return
         lock = self._get_symbol_lock(symbol)
         async with lock:
-            # 0. Ignora se já houver um trade aberto para este símbolo
-            if any(t.symbol == symbol for t in self._open_trades.values()):
+            if symbol in self._processing_symbols:
                 return
+            self._processing_symbols.add(symbol)
+        try:
+        # 0. Ignora se já houver um trade aberto para este símbolo
+        if any(t.symbol == symbol for t in self._open_trades.values()):
+            return
 
-            # 1. Candles + features.
-            raw_df = self.symbol_manager.get_candles_df(symbol)
-            if raw_df.empty or len(raw_df) < 55:
-                return
+        # 1. Candles + features.
+        raw_df = self.symbol_manager.get_candles_df(symbol)
+        if raw_df.empty or len(raw_df) < 55:
+            return
 
-            last_epoch = int(raw_df.iloc[-1]["epoch"])
-            prev_epoch = self._last_processed_epoch.get(symbol)
-            if prev_epoch == last_epoch:
-                # Já processamos este candle mais recente; evita duplicidade
-                return
-            self._last_processed_epoch[symbol] = last_epoch
+        last_epoch = int(raw_df.iloc[-1]["epoch"])
+        prev_epoch = self._last_processed_epoch.get(symbol)
+        if prev_epoch == last_epoch:
+            # Já processamos este candle mais recente; evita duplicidade
+            return
+        self._last_processed_epoch[symbol] = last_epoch
 
-            cache = FeatureCache.get_instance()
-            cached_df = cache.get_features(symbol, "features_df")
+        cache = FeatureCache.get_instance()
+        cached_df = cache.get_features(symbol, "features_df")
 
-            # FIX B17: Invalida por epoch E por TTL (evita cache stale pós-reconexão).
-            if (
-                cached_df is not None
-                and int(cached_df.iloc[-1].get("epoch", 0)) == last_epoch
-                and not cache.is_expired(symbol, "features_df", ttl_seconds=30)
-            ):
-                feat_df = cached_df
-            else:
-                feat_df = self._feature_engineer.compute(raw_df)
-                cache.set_features(symbol, "features_df", feat_df)
+        # FIX B17: Invalida por epoch E por TTL (evita cache stale pós-reconexão).
+        if (
+            cached_df is not None
+            and int(cached_df.iloc[-1].get("epoch", 0)) == last_epoch
+            and not cache.is_expired(symbol, "features_df", ttl_seconds=30)
+        ):
+            feat_df = cached_df
+        else:
+            feat_df = self._feature_engineer.compute(raw_df)
+            cache.set_features(symbol, "features_df", feat_df)
 
-            if feat_df.empty:
-                return
+        if feat_df.empty:
+            return
 
-            # 2. Consulta Gemini Advisor (se disponível e for hora de consultar).
-            await self._consult_gemini(feat_df, symbol)
+        # 2. Consulta Gemini Advisor (se disponível e for hora de consultar).
+        await self._consult_gemini(feat_df, symbol)
 
-            # 3. Ordena estratégias: Gemini prioriza uma delas movendo-a para frente.
-            strategies = self._get_ordered_strategies()
+        # 3. Ordena estratégias: Gemini prioriza uma delas movendo-a para frente.
+        strategies = self._get_ordered_strategies()
 
-            # 4. Avalia cada estratégia com filtro de qualidade
-            quality_gate: SignalQualityGate = get_signal_gate()
+        # 4. Avalia cada estratégia com filtro de qualidade
+        quality_gate: SignalQualityGate = get_signal_gate()
 
-            for strategy in strategies:
-                signal = strategy.generate_signal(feat_df, symbol, self._session_state)
-                if signal is None:
-                    continue
+        for strategy in strategies:
+            signal = strategy.generate_signal(feat_df, symbol, self._session_state)
+            if signal is None:
+                continue
 
-                # ── SignalQualityGate: filtra falsos sinais ───────────────────
-                quality_report = quality_gate.evaluate(signal, feat_df, self._session_state)
-                if not quality_report.passed:
-                    logger.debug(
-                        "Sinal rejeitado pelo QualityGate.",
-                        symbol=symbol,
-                        reason=quality_report.rejection_reason,
+            # ── SignalQualityGate: filtra falsos sinais ───────────────────
+            quality_report = quality_gate.evaluate(signal, feat_df, self._session_state)
+            if not quality_report.passed:
+                logger.debug(
+                    "Sinal rejeitado pelo QualityGate.",
+                    symbol=symbol,
+                    reason=quality_report.rejection_reason,
+                )
+                continue
+
+            # Aplica boost de qualidade à confiança
+            if quality_report.boost != 1.0:
+                signal = Signal(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    confidence=min(1.0, signal.confidence * quality_report.boost),
+                    strategy_name=signal.strategy_name,
+                    model_name=signal.model_name,
+                    contract_type=signal.contract_type,
+                    entry_price=signal.entry_price,
+                )
+
+            # Aplica o multiplicador de confiança do Gemini
+            if self._gemini_confidence_mult != 1.0:
+                signal = Signal(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    confidence=min(1.0, signal.confidence * self._gemini_confidence_mult),
+                    strategy_name=signal.strategy_name,
+                    model_name=signal.model_name,
+                    contract_type=signal.contract_type,
+                    entry_price=signal.entry_price,
+                )
+
+            # ── Oracle Council: votação dos especialistas ────────────────
+            if self.grand_oracle is not None:
+                peer_dfs = {
+                    s: self._feature_engineer.compute(
+                        self.symbol_manager.get_candles_df(s)
                     )
-                    continue
+                    for s in self.symbol_manager.ready_symbols
+                    if s != symbol
+                }
+                peer_dfs = {s: df for s, df in peer_dfs.items() if not df.empty}
 
-                # Aplica boost de qualidade à confiança
-                if quality_report.boost != 1.0:
-                    signal = Signal(
-                        symbol=signal.symbol,
-                        direction=signal.direction,
-                        confidence=min(1.0, signal.confidence * quality_report.boost),
-                        strategy_name=signal.strategy_name,
-                        model_name=signal.model_name,
-                        contract_type=signal.contract_type,
-                        entry_price=signal.entry_price,
-                    )
+                ticks = self.symbol_manager.get_recent_ticks(symbol)
+                decision = self.grand_oracle.decide(
+                    signal=signal,
+                    df=feat_df,
+                    session=self._session_state,
+                    ticks=ticks,
+                    peer_dfs=peer_dfs or None,
+                )
 
-                # Aplica o multiplicador de confiança do Gemini
-                if self._gemini_confidence_mult != 1.0:
-                    signal = Signal(
-                        symbol=signal.symbol,
-                        direction=signal.direction,
-                        confidence=min(1.0, signal.confidence * self._gemini_confidence_mult),
-                        strategy_name=signal.strategy_name,
-                        model_name=signal.model_name,
-                        contract_type=signal.contract_type,
-                        entry_price=signal.entry_price,
-                    )
-
-                # ── Oracle Council: votação dos especialistas ────────────────
-                if self.grand_oracle is not None:
-                    peer_dfs = {
-                        s: self._feature_engineer.compute(
-                            self.symbol_manager.get_candles_df(s)
-                        )
-                        for s in self.symbol_manager.ready_symbols
-                        if s != symbol
+                if self.broadcast_fn:
+                    votes_list = []
+                    for v in decision.votes.values():
+                        votes_list.append({
+                            "agent": v.agent_name,
+                            "action": v.action,
+                            "confidence": round(v.score, 4),
+                            "veto": v.veto,
+                            "reasoning": v.reasoning,
+                        })
+                    summary = {
+                        "approved": decision.approved,
+                        "action": decision.direction,
+                        "confidence": decision.confidence,
+                        "veto_by": decision.vetoed_by,
+                        "reasoning": decision.reasoning,
+                        "votes": votes_list,
                     }
-                    peer_dfs = {s: df for s, df in peer_dfs.items() if not df.empty}
+                    await self.broadcast_fn("council_vote", summary)
 
-                    ticks = self.symbol_manager.get_recent_ticks(symbol)
-                    decision = self.grand_oracle.decide(
-                        signal=signal,
-                        df=feat_df,
-                        session=self._session_state,
-                        ticks=ticks,
-                        peer_dfs=peer_dfs or None,
+                if not decision.approved:
+                    logger.info(
+                        "Oracle Council bloqueou o trade.",
+                        symbol=symbol,
+                        score=decision.confidence,
+                        veto_by=decision.vetoed_by,
                     )
+                    break
 
-                    if self.broadcast_fn:
-                        votes_list = []
-                        for v in decision.votes.values():
-                            votes_list.append({
-                                "agent": v.agent_name,
-                                "action": v.action,
-                                "confidence": round(v.score, 4),
-                                "veto": v.veto,
-                                "reasoning": v.reasoning,
-                            })
-                        summary = {
-                            "approved": decision.approved,
-                            "action": decision.direction,
-                            "confidence": decision.confidence,
-                            "veto_by": decision.vetoed_by,
-                            "reasoning": decision.reasoning,
-                            "votes": votes_list,
-                        }
-                        await self.broadcast_fn("council_vote", summary)
+                signal = Signal(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    confidence=min(1.0, decision.confidence),
+                    strategy_name=signal.strategy_name,
+                    model_name=f"council({decision.confidence:.2f})",
+                    contract_type=signal.contract_type,
+                    entry_price=signal.entry_price,
+                )
 
-                    if not decision.approved:
-                        logger.info(
-                            "Oracle Council bloqueou o trade.",
-                            symbol=symbol,
-                            score=decision.confidence,
-                            veto_by=decision.vetoed_by,
-                        )
-                        break
-
-                    signal = Signal(
-                        symbol=signal.symbol,
-                        direction=signal.direction,
-                        confidence=min(1.0, decision.confidence),
-                        strategy_name=signal.strategy_name,
-                        model_name=f"council({decision.confidence:.2f})",
-                        contract_type=signal.contract_type,
-                        entry_price=signal.entry_price,
-                    )
-
-                await self._handle_signal(signal)
-                break
+            await self._handle_signal(signal)
+            break
+        finally:
+            self._processing_symbols.discard(symbol)
 
     async def _consult_gemini(self, feat_df, symbol: str) -> None:
         """Consulta o Gemini Advisor e atualiza as prioridades/flags."""
         if self.gemini_advisor is None or not self.gemini_advisor.should_consult():
             return
         strategy_names = [s.name for s in self._strategies]
-        logger.info(f"DEBUG: type(self._strategy_results) = {type(self._strategy_results)}")
 
-        try:
-            recent_results = {
-                name: (
-                    sum(self._strategy_results[name][-20:]) / len(self._strategy_results[name][-20:])
-                    if self._strategy_results[name] else 0.5
-                )
-                for name in strategy_names
-            }
-        except TypeError as e:
-            logger.error(f"DEBUG CRASH: strategy_names={strategy_names}, type(_strategy_results)={type(self._strategy_results)}, _strategy_results={self._strategy_results}")
-            raise e
+        recent_results = {
+            name: (
+                sum(self._strategy_results[name][-20:]) / len(self._strategy_results[name][-20:])
+                if self._strategy_results[name] else 0.5
+            )
+            for name in strategy_names
+        }
         ctx = build_context_from_df(
             df=feat_df,
             symbol=symbol,
@@ -603,13 +607,13 @@ class ExecutionEngine:
             await repo.save(trade, self.session_id)
 
         # 6. Executa.
+        self._open_trades[trade.id] = trade
         try:
             result = await self.client.buy_contract(
                 proposal_id=proposal_id,
                 price=ask_price,
             )
             contract_id = result.get("buy", {}).get("contract_id", "")
-            self._open_trades[trade.id] = trade
             logger.success(
                 "Contrato aberto.",
                 trade_id=trade.id,
@@ -630,6 +634,7 @@ class ExecutionEngine:
                     "ts": trade.opened_at.isoformat(),
                 })
         except Exception as exc:
+            self._open_trades.pop(trade.id, None)
             logger.error("Falha ao executar contrato.", error=str(exc))
             async with get_session() as db:
                 repo = TradeRepository(db)

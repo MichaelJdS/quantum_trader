@@ -156,6 +156,21 @@ class GrandOracle:
         for agent in self.agents:
             try:
                 vote = agent.analyze(signal, df, session, ticks=ticks, peer_dfs=peer_dfs)
+                
+                # Penaliza agentes em bootstrap ou com win rate muito baixo
+                total = getattr(agent, "_trade_count", 0)
+                win_count = getattr(agent, "_win_count", 0)
+                win_rate = (win_count / max(1, total)) if total > 0 else 0.5
+                
+                # Agente em bootstrap (< 10 trades) vota com peso reduzido
+                if total < 10:
+                    vote.score *= 0.5
+                    vote.reasoning = f"[bootstrap {total}/10] {vote.reasoning}"
+                # Agente com win rate < 40% tem voto penalizado
+                elif total >= 10 and win_rate < 0.40:
+                    vote.score *= 0.6
+                    vote.reasoning = f"[low_wr {win_rate:.0%}] {vote.reasoning}"
+
                 agent._last_vote = vote
             except Exception as exc:
                 logger.warning("Agente falhou.", agent=agent.name, error=str(exc))
@@ -275,14 +290,55 @@ class GrandOracle:
         """
         result = self.analyze(signal, df, session, ticks=ticks, peer_dfs=peer_dfs)
         self._last_decision = result
+
+        majority_action = result["direction"]
+        votes = result.get("votes", {})
+        
+        MIN_CONFIDENCE_TO_APPROVE = 0.62   # era provavelmente 0.50
+        MIN_AGENTS_AGREEING = 4            # maioria de 8 agentes
+        
+        agreeing = sum(1 for v in votes.values() if getattr(v, "action", "") == majority_action)
+        confidence = self._weighted_confidence(votes, majority_action)
+
+        if agreeing < MIN_AGENTS_AGREEING or confidence < MIN_CONFIDENCE_TO_APPROVE:
+            return CouncilDecision(
+                approved=False,
+                direction=majority_action,
+                confidence=confidence,
+                reasoning=f"Consenso insuficiente: {agreeing}/8 agentes, {confidence:.0%} conf",
+                votes=votes,
+                vetoed_by="quorum",
+            )
+
         return CouncilDecision(
-            approved   = result["approved"],
-            direction  = result["direction"],
-            confidence = result["confidence"],
+            approved   = True,
+            direction  = majority_action,
+            confidence = confidence,
             vetoed_by  = result.get("vetoed_by"),
             reasoning  = result.get("reasoning", ""),
-            votes      = result.get("votes", {}),
+            votes      = votes,
         )
+
+    def _weighted_confidence(self, votes: dict, majority_action: str) -> float:
+        """Pondera a confiança de cada agente pelo seu win rate histórico."""
+        total_weight = 0.0
+        weighted_sum = 0.0
+        
+        for agent_name, vote in votes.items():
+            agent = self._agent_map.get(agent_name)
+            
+            # Win rate histórico do agente (mínimo 0.3 para não zerar o peso)
+            total = getattr(agent, "_trade_count", 0)
+            win_count = getattr(agent, "_win_count", 0)
+            win_rate = (win_count / max(1, total)) if total > 0 else 0.5
+            weight = max(0.3, win_rate)
+            
+            # Apenas votos alinhados com a direção majoritária contribuem
+            if getattr(vote, "action", "") == majority_action:
+                weighted_sum += vote.score * weight
+            total_weight += weight
+        
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
 
     def notify_outcome(
         self,
