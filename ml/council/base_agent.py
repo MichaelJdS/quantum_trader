@@ -248,8 +248,14 @@ class BaseAgent(ABC):
         recent_50 = list(self._memory)[-50:] if self._memory else []
         wr_50 = sum(1 for m in recent_50 if m.won) / max(len(recent_50), 1)
         avg_pnl = sum(m.pnl for m in recent_50) / max(len(recent_50), 1)
+        
+        last_action = self._last_vote.action if self._last_vote else "NEUTRAL"
+        last_conf   = self._last_vote.score if self._last_vote else 0.0
+
         return {
             "agent":        self.name,
+            "action":       last_action,
+            "confidence":   last_conf,
             "trades_total": self._trade_count,
             "win_rate_50":  round(wr_50, 3),
             "avg_pnl_50":   round(avg_pnl, 4),

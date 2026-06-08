@@ -22,6 +22,8 @@ class SymbolState:
     is_ready: bool = False
     last_tick_epoch: int | None = None
     last_candle_epoch: int | None = None
+    last_price: float | None = None
+    last_update: float | None = None
 
 
 class SymbolManager:
@@ -49,6 +51,8 @@ class SymbolManager:
         }
         self._lock = asyncio.Lock()
         self._initialized = False
+        self._engine: Any | None = None
+        self._broadcast_fn: Callable | None = None
 
     # ── Inicialização ─────────────────────────────────────────────────────────
 
@@ -61,6 +65,8 @@ class SymbolManager:
 
         for symbol in self._symbols:
             await self._initialize_symbol(symbol)
+
+        await self._start_candle_streams()
 
         self._initialized = True
         logger.success(
@@ -110,6 +116,72 @@ class SymbolManager:
                 symbol=symbol,
                 error=str(exc),
             )
+
+    async def _start_candle_streams(self) -> None:
+        """Inicia stream de candles em tempo real para cada símbolo."""
+        for symbol in self._symbols:
+            gran = self._granularity
+            asyncio.create_task(
+                self._client.stream_candles(
+                    symbol=symbol,
+                    granularity=gran,
+                    callback=self._on_live_candle,
+                ),
+                name=f"candle_stream_{symbol}",
+            )
+        logger.info("📡 Streams de candles iniciados.", symbols=self._symbols)
+
+    async def _on_live_candle(self, candle: dict) -> None:
+        """Callback chamado instantaneamente a cada vela nova."""
+        import time
+        from datetime import datetime, timezone
+        
+        symbol = candle.get("symbol") or candle.get("underlying")
+        if not symbol:
+            return
+            
+        async with self._lock:
+            state = self._states.get(symbol)
+            if state is None:
+                return
+            # Atualiza DataFrame de candles
+            new_row = {
+                "epoch": int(candle.get("epoch", 0)),
+                "open":  float(candle.get("open",  0)),
+                "high":  float(candle.get("high",  0)),
+                "low":   float(candle.get("low",   0)),
+                "close": float(candle.get("close", 0)),
+            }
+            if state.candles_df is not None:
+                # Atualiza a última vela se mesmo epoch, senão appenda
+                if (len(state.candles_df) > 0 and
+                        state.candles_df.iloc[-1]["epoch"] == new_row["epoch"]):
+                    state.candles_df.iloc[-1] = new_row
+                else:
+                    import pandas as pd
+                    state.candles_df = pd.concat(
+                        [state.candles_df, pd.DataFrame([new_row])],
+                        ignore_index=True,
+                    ).tail(2000)  # mantém últimas 2000 velas
+            state.last_price = new_row["close"]
+            state.last_update = time.time()
+
+        # Broadcast instantâneo de tick para o dashboard
+        await self._broadcast_tick(symbol, new_row["close"], new_row["epoch"])
+        
+        # Avisa o motor de execução instantaneamente
+        if hasattr(self, '_engine') and self._engine:
+            await self._engine._candle_queue.put((symbol, new_row))
+
+    async def _broadcast_tick(self, symbol: str, price: float, epoch: int) -> None:
+        from datetime import datetime, timezone
+        if hasattr(self, '_broadcast_fn') and self._broadcast_fn:
+            await self._broadcast_fn("tick", {
+                "symbol": symbol,
+                "price":  price,
+                "epoch":  epoch,
+                "ts":     datetime.now(tz=timezone.utc).isoformat(),
+            })
 
     # ── Tick stream ───────────────────────────────────────────────────────────
 

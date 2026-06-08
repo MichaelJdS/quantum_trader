@@ -62,7 +62,11 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-1.5-pro", alias="GEMINI_MODEL")
     gemini_consult_interval_seconds: int = Field(default=60, alias="GEMINI_CONSULT_INTERVAL_SECONDS")
-    groq_api_keys: list[str] = Field(default_factory=list, alias="GROQ_API_KEYS")
+    groq_api_keys_raw: str = Field(default="", alias="GROQ_API_KEYS")
+
+    @property
+    def groq_api_keys(self) -> list[str]:
+        return [k.strip() for k in self.groq_api_keys_raw.split(",") if k.strip()]
 
     # ── Cloud / API ───────────────────────────────────────────────────────────
     api_host: str = Field(default="127.0.0.1", alias="API_HOST")
@@ -133,12 +137,7 @@ class Settings(BaseSettings):
         value = value.strip()
         return value or None
 
-    @field_validator("groq_api_keys", mode="before")
-    @classmethod
-    def parse_groq_keys(cls, v):
-        if isinstance(v, str):
-            return [k.strip() for k in v.split(",") if k.strip()]
-        return v or []
+    # groq_api_keys validator substituído por property acima
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

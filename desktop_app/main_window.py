@@ -344,6 +344,9 @@ class MainWindow(QMainWindow):
         elif event == "gemini_advice":
             self._dashboard.on_gemini_advice(data)
 
+        elif event == "tick":
+            self._dashboard.on_tick(data)
+
         elif event in ("bot_started", "bot_stopped"):
             self._poll_status()
 

@@ -156,9 +156,11 @@ class GrandOracle:
         for agent in self.agents:
             try:
                 vote = agent.analyze(signal, df, session, ticks=ticks, peer_dfs=peer_dfs)
+                agent._last_vote = vote
             except Exception as exc:
                 logger.warning("Agente falhou.", agent=agent.name, error=str(exc))
                 vote = AgentVote(agent.name, "NEUTRAL", 0.5, reasoning=f"Erro: {exc}")
+                agent._last_vote = vote
             votes[agent.name] = vote
 
         self._last_votes = votes
@@ -272,6 +274,7 @@ class GrandOracle:
         Usado pelo ExecutionEngine.
         """
         result = self.analyze(signal, df, session, ticks=ticks, peer_dfs=peer_dfs)
+        self._last_decision = result
         return CouncilDecision(
             approved   = result["approved"],
             direction  = result["direction"],
@@ -378,14 +381,40 @@ class GrandOracle:
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
     def get_council_health(self) -> dict:
-        """Retorna diagnóstico completo de todos os agentes."""
+        """Retorna diagnóstico completo de todos os agentes (Dashboard V2)."""
         overall_wr = self._total_wins / max(self._trade_count, 1)
+        
+        agents_info = []
+        for agent in self.agents:
+            info = agent.get_introspection()
+            vote = getattr(agent, '_last_vote', None)
+            
+            action = getattr(vote, "action", "NEUTRAL") if vote else "NEUTRAL"
+            conf = getattr(vote, "score", 0.0) if vote else 0.0
+            reasoning = getattr(vote, "reasoning", "Aguardando sinal") if vote else "Aguardando sinal"
+            
+            info.update({
+                "agent": agent.name,
+                "action": action,
+                "confidence": conf,
+                "reasoning": reasoning
+            })
+            agents_info.append(info)
+            
+        last_dec = getattr(self, '_last_decision', {})
+        
         return {
+            "status": "active",
+            "last_decision": {
+                "action": last_dec.get("direction", "NEUTRAL") if isinstance(last_dec, dict) else "NEUTRAL",
+                "confidence": last_dec.get("confidence", 0.0) if isinstance(last_dec, dict) else 0.0,
+                "votes": agents_info
+            },
             "oracle_trades":    self._trade_count,
             "oracle_win_rate":  round(overall_wr, 3),
             "oracle_weights":   {k: round(v, 4) for k, v in self._weights.items()},
             "groq_in_council":  "GROQ" in self._agent_map,
-            "agents": [a.get_introspection() for a in self.agents],
+            "agents":           agents_info,
         }
 
     # ── Helpers ───────────────────────────────────────────────────────────────

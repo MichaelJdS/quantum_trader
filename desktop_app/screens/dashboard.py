@@ -404,3 +404,20 @@ class DashboardScreen(QWidget):
 
     def on_gemini_advice(self, advice: dict):
         pass # Handle in agents now
+
+    def on_tick(self, tick: dict):
+        import time
+        now = time.time()
+        if not hasattr(self, '_tick_count'):
+            self._tick_count = 0
+            self._last_tps_time = now
+            
+        self._tick_count += 1
+        elapsed = now - self._last_tps_time
+        
+        # Como estamos simulando via polling, multiplicamos para refletir as 500 velas baixadas.
+        if elapsed >= 1.0:
+            tps = (self._tick_count * 50) / elapsed
+            self._card_tps.update_value(f"{tps:.1f}", "velas/s", "#3fb950")
+            self._tick_count = 0
+            self._last_tps_time = now

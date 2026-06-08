@@ -106,6 +106,10 @@ class FeatureEngineer:
             (data["bb_upper"] < data["kc_upper"])
             & (data["bb_lower"] > data["kc_lower"])
         )
+        data["squeeze"] = data["is_squeeze"]  # Alias para compatibilidade com estratégias antigas
+        
+        data["is_bullish"] = (data["close"] > data["open"]).astype(int)
+        data["is_bearish"] = (data["close"] < data["open"]).astype(int)
 
         atr_q20 = data["atr_14"].rolling(50, min_periods=20).quantile(0.20)
         data["low_volatility"] = data["atr_14"] < atr_q20
@@ -124,7 +128,7 @@ class FeatureEngineer:
             "tr", "atr_14", "adx",
             "bb_mid", "bb_upper", "bb_lower", "bb_width",
             "kc_mid", "kc_upper", "kc_lower",
-            "is_squeeze", "low_volatility",
+            "is_squeeze", "squeeze", "is_bullish", "is_bearish", "low_volatility",
         ]
         data = data[keep_cols].dropna().reset_index(drop=True)
 

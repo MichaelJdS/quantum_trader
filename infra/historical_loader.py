@@ -1,141 +1,139 @@
 """
-infra/historical_loader.py — HistoricalLoader v1.0
-
-No boot do sistema:
-  1. Baixa 1000 candles em TODAS as granularidades candidatas para cada símbolo
-  2. Roda FeatureEngineer em cada DataFrame
-  3. Envia tudo ao MarketProfiler → SymbolProfile(gran, duration, unit)
-  4. Atualiza o SymbolManager com a granularidade ótima
-  5. Retorna dict[symbol → SymbolProfile] para o ExecutionEngine
+infra/historical_loader.py — Download de dados históricos no boot
 """
 from __future__ import annotations
-
 import asyncio
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-
+import pandas as pd
 from loguru import logger
-
-from ml.feature_engineer import FeatureEngineer
-from ml.market_profiler import MarketProfiler, CANDIDATE_GRANULARITIES
 
 if TYPE_CHECKING:
     from infra.deriv_client import DerivClient
     from infra.symbol_manager import SymbolManager
-    from ml.market_profiler import SymbolProfile
+
+CANDIDATE_GRANULARITIES = [60, 120, 180, 300]
+CANDLES_PER_GRAN        = 1500   # mais candles = mais histórico
+FALLBACK_GRAN           = 60
+FALLBACK_COUNT          = 800
+MIN_CANDLES_REQUIRED    = 200    # mínimo para Bollinger + EMA + RSI
 
 
+@dataclass
 class HistoricalLoader:
-    """
-    Responsável pelo carregamento histórico inteligente no boot.
-    """
+    client:         "DerivClient"
+    symbol_manager: "SymbolManager"
+    symbols:        list[str]
+    _loaded: dict[str, bool] = field(default_factory=dict, init=False)
 
-    CANDLES_PER_GRAN = 1000   # candles por granularidade
+    async def load_all(self, timeout: float = 120.0) -> None:
+        logger.info("📥 HistoricalLoader: iniciando...", symbols=self.symbols)
+        tasks   = [asyncio.create_task(self._load_symbol(s, timeout)) for s in self.symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for sym, res in zip(self.symbols, results):
+            if isinstance(res, Exception):
+                logger.warning("Fallback para símbolo.", symbol=sym, error=str(res))
+                await self._fallback(sym)
+            else:
+                self._loaded[sym] = True
 
-    def __init__(
-        self,
-        client: "DerivClient",
-        symbol_manager: "SymbolManager",
-        profiler: MarketProfiler | None = None,
-    ) -> None:
-        self._client   = client
-        self._sm       = symbol_manager
-        self._profiler = profiler or MarketProfiler()
-        self._fe       = FeatureEngineer()
+        # Após carregar todos, dispara cálculo de features em cada símbolo
+        await self._warm_up_features()
 
-    async def load_all(self) -> dict[str, SymbolProfile]:
-        """
-        Executa o boot histórico para todos os símbolos gerenciados.
-        Retorna map symbol → SymbolProfile com a decisão ótima.
-        """
-        symbols = self._sm.symbols
-        logger.info(
-            "HistoricalLoader: iniciando boot multi-granularidade.",
-            symbols=symbols,
-            granularities=CANDIDATE_GRANULARITIES,
-        )
+        loaded = sum(1 for v in self._loaded.values() if v)
+        logger.success("📥 HistoricalLoader concluído.", loaded=loaded, total=len(self.symbols))
 
-        profiles: dict[str, SymbolProfile] = {}
+    async def _warm_up_features(self) -> None:
+        """Força cálculo de features injetando candles históricos no SymbolManager."""
+        logger.info("🔥 Aquecendo features históricas...")
+        for sym in self.symbols:
+            try:
+                async with self.symbol_manager._lock:
+                    state = self.symbol_manager._states.get(sym)
+                if state is None or state.candles_df is None or len(state.candles_df) < 20:
+                    logger.warning("Candles insuficientes para warm-up.", symbol=sym)
+                    continue
 
-        # Paraleliza por símbolo (max 3 simultâneos para não estressar a API)
-        semaphore = asyncio.Semaphore(3)
+                df   = state.candles_df.copy()
+                tail = df.tail(300)
 
-        async def load_symbol(sym: str) -> None:
-            async with semaphore:
-                p = await self._load_symbol(sym)
-                profiles[sym] = p
+                for _, row in tail.iterrows():
+                    # Evita erro de tipagem Any | None do row.get() no Pylance
+                    val = row["close"] if "close" in row else row.iloc[-1]
+                    price = float(val) if val is not None else 0.0
+                    # Tenta os nomes possíveis do método de tick no SymbolManager
+                    if hasattr(self.symbol_manager, "_handle_tick"):
+                        await self.symbol_manager._handle_tick({"tick": {"symbol": sym, "quote": price, "epoch": 0}})
+                    elif hasattr(self.symbol_manager, "_process_tick"):
+                        await self.symbol_manager._process_tick(sym, {"symbol": sym, "quote": price, "epoch": 0})
+                    elif hasattr(self.symbol_manager, "on_tick"):
+                        await self.symbol_manager.on_tick(sym, price)
+                    elif hasattr(self.symbol_manager, "_update_symbol"):
+                        await self.symbol_manager._update_symbol(sym, price)
+                    else:
+                        # Injeta diretamente no buffer de preços do estado
+                        async with self.symbol_manager._lock:
+                            s = self.symbol_manager._states.get(sym)
+                            if s is not None and hasattr(s, "price_buffer"):
+                                s.price_buffer.append(price)
+                            elif s is not None and hasattr(s, "ticks"):
+                                s.ticks.append(price)
 
-        await asyncio.gather(*[load_symbol(sym) for sym in symbols])
+                logger.info("✅ Features aquecidas.", symbol=sym, candles=len(tail))
+            except Exception as exc:
+                logger.warning("Warm-up falhou.", symbol=sym, error=str(exc))
 
-        logger.success(
-            "HistoricalLoader: boot concluído.",
-            profiles={
-                sym: f"{p.granularity}s/{p.duration}{p.duration_unit}"
-                for sym, p in profiles.items()
-            },
-        )
-        return profiles
-
-    async def _load_symbol(self, symbol: str) -> SymbolProfile:
-        """Baixa dados em todas as granularidades e perfia o símbolo."""
-        multi_dfs = {}
-
+    async def _load_symbol(self, symbol: str, timeout: float) -> None:
+        best_df, best_gran, best_score = None, FALLBACK_GRAN, -1.0
+        per_gran_timeout = timeout / len(CANDIDATE_GRANULARITIES)
         for gran in CANDIDATE_GRANULARITIES:
             try:
-                candles = await self._client.get_candles(
-                    symbol=symbol,
-                    granularity=gran,
-                    count=self.CANDLES_PER_GRAN,
+                candles = await asyncio.wait_for(
+                    self.client.get_candles(symbol=symbol, granularity=gran, count=CANDLES_PER_GRAN),
+                    timeout=per_gran_timeout,
                 )
-                if not candles:
+                if not candles or len(candles) < MIN_CANDLES_REQUIRED:
                     continue
-
-                raw_df = self._sm._candles_to_df(candles)
-                if raw_df.empty or len(raw_df) < 80:
-                    continue
-
-                feat_df = self._fe.compute(raw_df)
-                if not feat_df.empty:
-                    multi_dfs[gran] = feat_df
-
-                logger.debug(
-                    "Granularidade carregada.",
-                    symbol=symbol,
-                    gran=f"{gran}s",
-                    candles=len(feat_df),
-                )
-
-                # Pequena pausa entre requisições para respeitar rate limit
-                await asyncio.sleep(0.15)
-
+                df    = self.symbol_manager._candles_to_df(candles)
+                score = self._volatility_score(df)
+                if score > best_score:
+                    best_score, best_df, best_gran = score, df, gran
             except Exception as exc:
-                logger.warning(
-                    "Falha ao carregar granularidade.",
-                    symbol=symbol,
-                    gran=gran,
-                    error=str(exc),
-                )
+                logger.debug("Gran falhou.", symbol=symbol, gran=gran, error=str(exc))
 
-        if not multi_dfs:
-            logger.warning(
-                "Nenhuma granularidade carregada — usando fallback 60s/5t.",
-                symbol=symbol,
+        if best_df is None or len(best_df) < MIN_CANDLES_REQUIRED:
+            raise RuntimeError(f"Candles insuficientes para {symbol}")
+
+        async with self.symbol_manager._lock:
+            state = self.symbol_manager._states.get(symbol)
+            if state is not None:
+                state.candles_df = best_df
+                state.is_ready   = True
+        logger.info("✅ Histórico carregado.", symbol=symbol, gran=best_gran, candles=len(best_df))
+
+    async def _fallback(self, symbol: str) -> None:
+        try:
+            candles = await asyncio.wait_for(
+                self.client.get_candles(symbol=symbol, granularity=FALLBACK_GRAN, count=FALLBACK_COUNT),
+                timeout=30.0,
             )
-            from ml.market_profiler import SymbolProfile
-            import time
-            return SymbolProfile(
-                symbol=symbol, granularity=60, duration=5,
-                duration_unit="t", score=0.0, win_rate=0.5,
-                evaluated_at=time.time(),
-            )
+            if candles and len(candles) >= MIN_CANDLES_REQUIRED:
+                df = self.symbol_manager._candles_to_df(candles)
+                async with self.symbol_manager._lock:
+                    s = self.symbol_manager._states.get(symbol)
+                    if s is not None:
+                        s.candles_df = df
+                        s.is_ready   = True
+                self._loaded[symbol] = True
+                logger.info("✅ Fallback carregado.", symbol=symbol, candles=len(df))
+        except Exception as exc:
+            logger.error("Fallback falhou.", symbol=symbol, error=str(exc))
 
-        # Roda profiler
-        profile = self._profiler.profile(symbol, multi_dfs)
-
-        # Atualiza SymbolManager com a granularidade ótima + DataFrame já carregado
-        best_df = multi_dfs[profile.granularity]
-        async with self._sm._lock:
-            self._sm._states[symbol].candles_df   = best_df
-            self._sm._states[symbol].is_ready     = True
-            self._sm._granularity                 = profile.granularity
-
-        return profile
+    @staticmethod
+    def _volatility_score(df: pd.DataFrame) -> float:
+        if "close" not in df.columns or len(df) < 10:
+            return 0.0
+        returns = df["close"].pct_change().dropna()
+        if returns.empty or returns.std() == 0:
+            return 0.0
+        return returns.std() / (abs(returns.mean()) + 1e-9)

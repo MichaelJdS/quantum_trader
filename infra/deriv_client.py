@@ -142,6 +142,7 @@ class DerivClient:
         self._pending: dict[int, asyncio.Future[dict]] = {}
         self._callbacks: dict[str, list[MessageCallback]] = {}
         self._subscriptions: dict[str, str] = {}  # symbol → sub_id
+        self._stream_queues: dict[int, asyncio.Queue] = {}
         self._authorized: bool = False
         self._running: bool = False
         self._circuit: CircuitBreaker = CircuitBreaker(threshold=5, reset_timeout=60.0)
@@ -273,6 +274,10 @@ class DerivClient:
                     fut = self._pending.pop(req_id)
                     if not fut.done():
                         fut.set_result(data)
+                        
+                # Roteia para streams persistentes
+                if req_id and req_id in self._stream_queues:
+                    self._stream_queues[req_id].put_nowait(data)
 
                 # Despacha callbacks por tipo de mensagem.
                 msg_type = data.get("msg_type")
@@ -427,6 +432,64 @@ class DerivClient:
         await self._send_raw({"forget_all": "ticks"}, timeout=5.0)
         self._subscriptions.clear()
         logger.info("Todas as subscriptions canceladas.")
+
+    async def stream_candles(
+        self,
+        symbol: str,
+        granularity: int,
+        callback: Callable[[dict], Awaitable[None]],
+    ) -> None:
+        """
+        Subscreve candles em tempo real via WebSocket da Deriv.
+        Chama `callback` a cada nova vela fechada.
+        """
+        req = {
+            "ticks_history": symbol,
+            "granularity":   granularity,
+            "style":         "candles",
+            "count":         1,
+            "subscribe":     1,
+            "end":           "latest",
+        }
+        sub_id = None
+        try:
+            async for message in self._ws_send_subscribe(req):
+                candle = message.get("ohlc") or (message.get("candles", [{}])[-1] if "candles" in message else None)
+                if candle:
+                    await callback(candle)
+                if sub_id is None:
+                    sub_id = message.get("subscription", {}).get("id")
+        finally:
+            if sub_id:
+                # Usa um envio silencioso para unsubscribe
+                try:
+                    await self._send_raw({"forget": sub_id}, timeout=5.0)
+                except Exception:
+                    pass
+
+    async def _ws_send_subscribe(self, req: dict):
+        """Gerador assíncrono que emite mensagens de uma subscrição."""
+        if self._ws is None:
+            raise DerivConnectionError("WebSocket não está conectado.")
+            
+        await self._rate_limiter.acquire()
+        
+        self._req_id += 1
+        req_id = self._req_id
+        req["req_id"] = req_id
+        
+        queue: asyncio.Queue = asyncio.Queue()
+        self._stream_queues[req_id] = queue
+        
+        try:
+            await self._ws.send(json.dumps(req))
+            while True:
+                msg = await queue.get()
+                if msg is None:
+                    break
+                yield msg
+        finally:
+            self._stream_queues.pop(req_id, None)
 
     async def subscribe_open_contracts(self) -> None:
         """Inscreve em atualizações de todos os contratos abertos."""

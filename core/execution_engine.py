@@ -68,6 +68,7 @@ class ExecutionEngine:
     _last_processed_epoch: dict[str, int] = field(
         default_factory=dict, init=False
     )
+    _candle_queue: asyncio.Queue = field(default_factory=asyncio.Queue, init=False)
     # FIX B9: Mantém referência forte às tasks para evitar GC prematuro.
     _pending_tasks: set[asyncio.Task] = field(default_factory=set, init=False)
     # FIX C1: Mapa de contract_id → Future para receber resultado live.
@@ -78,6 +79,7 @@ class ExecutionEngine:
     # Estratégia recomendada pelo Gemini (None = sem preferência)
     _gemini_priority: str | None = field(default=None, init=False)
     _gemini_confidence_mult: float = field(default=1.0, init=False)
+    _circuit_breaker: Any = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._feature_engineer = FeatureEngineer()
@@ -156,12 +158,20 @@ class ExecutionEngine:
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
 
+        # Dispara o loop reativo de candles em background
         self._running = True
+        try:
+            self._main_task = asyncio.create_task(
+                self._event_loop(), name="engine_event_loop"
+            )
+        except Exception:
+            pass
 
-        poll_task = asyncio.create_task(self._polling_loop(), name="engine_polling")
-        self._pending_tasks.add(poll_task)
-        poll_task.add_done_callback(self._pending_tasks.discard)
-
+        # Polling como fallback garantido
+        self._polling_task = asyncio.create_task(
+            self._polling_loop(), name="engine_polling_loop"
+        )
+        
         logger.success(
             "ExecutionEngine iniciado.",
             balance=balance,
@@ -234,59 +244,96 @@ class ExecutionEngine:
             await self._process_symbol(symbol)
         return handler
 
+    async def _event_loop(self) -> None:
+        logger.info("⚡ Event loop iniciado (stream mode).")
+        while self._running:
+            try:
+                # Timeout para não travar se a queue ficar vazia
+                try:
+                    item = await asyncio.wait_for(
+                        self._candle_queue.get(), timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    continue  # sem velas em 30s — só aguarda
+
+                # Desempacota com segurança
+                if isinstance(item, tuple) and len(item) == 2:
+                    symbol, candle = item
+                elif isinstance(item, str):
+                    symbol = item
+                    candle = {}
+                else:
+                    continue
+
+                if self._circuit_breaker and self._circuit_breaker.is_open:
+                    logger.warning(
+                        "Circuit Breaker aberto — pulando ciclo.",
+                        reason=getattr(self._circuit_breaker, "trip_reason", "Desconhecido"),
+                    )
+                    continue
+
+                # Usa _process_symbol se existir (como na base atual)
+                if hasattr(self, '_run_cycle'):
+                    await self._run_cycle(symbol) # type: ignore
+                elif hasattr(self, '_process_symbol'):
+                    await self._process_symbol(symbol)
+                elif hasattr(self, '_analyze_and_trade'):
+                    await self._analyze_and_trade(symbol) # type: ignore
+                else:
+                    # Fallback: dispara o pipeline de sinais diretamente
+                    if hasattr(self, '_handle_symbol_update'):
+                        await self._handle_symbol_update(symbol) # type: ignore
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                import traceback
+                logger.error(f"Event loop erro:\n{traceback.format_exc()}")
+                await asyncio.sleep(1.0)
+        logger.info("Event loop encerrado.")
+
     async def _polling_loop(self) -> None:
         """
-        Loop de polling: baixa velas atualizadas da Deriv e roda as estratégias.
-
-        Executa a cada POLL_INTERVAL segundos, independente de subscriptions de
-        ticks WebSocket. Garante que o bot funcione mesmo que a subscription
-        de ticks falhe.
+        Loop de fallback (polling).
+        Busca velas atualizadas da Deriv a cada 10s caso o stream falhe.
         """
-        POLL_INTERVAL = 10  # segundos entre cada ciclo de avaliação
-        COUNT = 500         # quantas velas buscar por ciclo (mantém histório longo)
-
-        logger.info("Polling loop iniciado.", interval_s=POLL_INTERVAL)
-
-        # Aguarda 2s para dar tempo ao startup — depois inicia imediatamente.
+        POLL_INTERVAL = 10
+        COUNT = 500
+        
+        logger.info("Polling loop iniciado (fallback mode).", interval_s=POLL_INTERVAL)
         await asyncio.sleep(2)
 
         while self._running:
             for symbol in list(self.symbol_manager.ready_symbols):
                 try:
-                    # Baixa as velas mais recentes da API Deriv
                     candles = await self.client.get_candles(
                         symbol=symbol,
                         granularity=self.symbol_manager._granularity,
                         count=COUNT,
                     )
                     if candles:
-                        # Atualiza o DataFrame do SymbolManager com dados frescos
                         new_df = self.symbol_manager._candles_to_df(candles)
                         async with self.symbol_manager._lock:
                             self.symbol_manager._states[symbol].candles_df = new_df
                             self.symbol_manager._states[symbol].is_ready = True
-
-                        logger.debug(
-                            "Candles atualizados via polling.",
-                            symbol=symbol,
-                            count=len(candles),
-                        )
-
-                        # Roda o pipeline completo de estratégias com dados frescos
+                            
+                        if self.broadcast_fn:
+                            last_c = candles[-1]
+                            await self.broadcast_fn("tick", {
+                                "symbol": symbol,
+                                "quote": last_c.get("close", 0),
+                                "epoch": last_c.get("epoch", 0),
+                            })
+                            
                         await self._process_symbol(symbol)
-
                 except asyncio.CancelledError:
-                    logger.info("Polling loop cancelado.")
                     return
                 except Exception as exc:
-                    logger.warning(
-                        "Polling falhou para símbolo.",
-                        symbol=symbol,
-                        error=str(exc),
-                    )
-
+                    import traceback
+                    logger.warning(f"Polling fallback falhou para símbolo {symbol}:\n{traceback.format_exc()}")
+            
             await asyncio.sleep(POLL_INTERVAL)
-
+            
         logger.info("Polling loop encerrado.")
 
     async def _process_symbol(self, symbol: str) -> None:
@@ -442,13 +489,19 @@ class ExecutionEngine:
         if self.gemini_advisor is None or not self.gemini_advisor.should_consult():
             return
         strategy_names = [s.name for s in self._strategies]
-        recent_results = {
-            name: (
-                sum(self._strategy_results[name][-20:]) / len(self._strategy_results[name][-20:])
-                if self._strategy_results[name] else 0.5
-            )
-            for name in strategy_names
-        }
+        logger.info(f"DEBUG: type(self._strategy_results) = {type(self._strategy_results)}")
+
+        try:
+            recent_results = {
+                name: (
+                    sum(self._strategy_results[name][-20:]) / len(self._strategy_results[name][-20:])
+                    if self._strategy_results[name] else 0.5
+                )
+                for name in strategy_names
+            }
+        except TypeError as e:
+            logger.error(f"DEBUG CRASH: strategy_names={strategy_names}, type(_strategy_results)={type(self._strategy_results)}, _strategy_results={self._strategy_results}")
+            raise e
         ctx = build_context_from_df(
             df=feat_df,
             symbol=symbol,
@@ -655,6 +708,22 @@ class ExecutionEngine:
                     status = TradeStatus.WON if won else TradeStatus.LOST
                     raw_exit = contract_data.get("exit_tick")
                     exit_price = float(raw_exit) if raw_exit is not None else (trade.entry_price or 0.0)
+
+            # Circuit Breaker check
+            if not won and hasattr(self, "_circuit_breaker") and self._circuit_breaker:
+                self._circuit_breaker.register_loss()
+                self._circuit_breaker.check(
+                    consecutive_losses=self._session_state.consecutive_losses + 1,
+                    current_balance=self._session_state.current_balance + pnl,
+                    initial_balance=self._session_state.initial_balance,
+                )
+                if self._circuit_breaker.is_open:
+                    logger.critical(
+                        "🔴 Circuit Breaker aberto — bot pausado.",
+                        reason=self._circuit_breaker.trip_reason,
+                        resume_in=self._circuit_breaker.seconds_until_reset,
+                    )
+                    self._running = False
 
             closed_at = datetime.now(tz=timezone.utc)
 

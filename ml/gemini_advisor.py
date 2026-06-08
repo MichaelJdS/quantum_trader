@@ -23,11 +23,12 @@ if TYPE_CHECKING:
 
 # Importação condicional para não travar se a lib não estiver instalada
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False
-    logger.warning("google-generativeai não instalado. GeminiAdvisor desativado.")
+    logger.warning("google-genai não instalado. GeminiAdvisor desativado.")
 
 
 # ── Tipos de dados ────────────────────────────────────────────────────────────
@@ -68,21 +69,16 @@ class GeminiAdvisor:
         GEMINI_CONSULT_INTERVAL_SECONDS — intervalo mínimo entre consultas em segundos (default: 300)
     """
 
-    _SYSTEM_PROMPT = """\
-Você é um consultor especialista em trading quantitativo para a plataforma Deriv.
-Analise o contexto do mercado abaixo e retorne EXATAMENTE um JSON válido com a estrutura:
+    SYSTEM_INSTRUCTION = """
+Você é um analista quantitativo. Responda SEMPRE e SOMENTE com JSON válido.
+Nunca adicione texto, markdown, blocos de código ou explicações fora do JSON.
+Formato obrigatório:
 {
-  "recommended_strategy": "<nome_da_estrategia>",
+  "recommended_strategy": "BUY" | "SELL" | "NEUTRAL",
   "confidence_multiplier": <float entre 0.5 e 1.5>,
-  "risk_flag": <true|false>,
-  "reasoning": "<justificativa curta em português>"
+  "risk_flag": <true | false>,
+  "reasoning": "<máximo 100 caracteres>"
 }
-
-Regras:
-- recommended_strategy deve ser um dos nomes disponíveis fornecidos
-- confidence_multiplier > 1.0 = aumentar confiança; < 1.0 = reduzir
-- risk_flag = true se identificar condições adversas (alta volatilidade, tendência incerta, muitas perdas consecutivas)
-- Responda APENAS com o JSON, sem markdown, sem explicações extras
 """
 
     def __init__(self) -> None:
@@ -92,7 +88,7 @@ Regras:
         self._interval   = _s.gemini_consult_interval_seconds
         self._last_consulted: float = 0.0
         self._last_advice: GeminiAdvice | None = None
-        self._model = None
+        self._client = None
         self._enabled = False
         self._lock = asyncio.Lock()
 
@@ -108,11 +104,7 @@ Regras:
             return
 
         try:
-            genai.configure(api_key=self._api_key)
-            self._model = genai.GenerativeModel(
-                model_name=self._model_name,
-                system_instruction=self._SYSTEM_PROMPT,
-            )
+            self._client = genai.Client(api_key=self._api_key)
             self._enabled = True
             logger.success(
                 "GeminiAdvisor inicializado.",
@@ -173,15 +165,16 @@ Regras:
         Interface de chat livre para o usuário conversar com o Gemini
         diretamente pelo painel do App Windows.
         """
-        if not self._enabled or self._model is None:
+        if not self._enabled or self._client is None:
             return "❌ Gemini não configurado. Adicione GEMINI_API_KEY ao .env"
 
         prompt = f"{context}\n\nPergunta do trader: {user_message}" if context else user_message
         try:
             response = await asyncio.to_thread(
-                lambda: self._model.generate_content(  # type: ignore[union-attr]
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(  # type: ignore[attr-defined]
+                lambda: self._client.models.generate_content(  # type: ignore[union-attr]
+                    model=self._model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
                         temperature=0.7,
                         max_output_tokens=1024,
                     ),
@@ -197,11 +190,14 @@ Regras:
     def _sync_consult(self, context: StrategyContext) -> GeminiAdvice:
         """Chamada síncrona à API Gemini (executada via thread pool)."""
         prompt = self._build_prompt(context)
-        response = self._model.generate_content(  # type: ignore[union-attr]
-            prompt,
-            generation_config=genai.types.GenerationConfig(  # type: ignore[attr-defined]
-                temperature=0.3,
-                max_output_tokens=512,
+        response = self._client.models.generate_content(
+            model=self._model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                system_instruction=self.SYSTEM_INSTRUCTION,
+                temperature=0.1,
+                max_output_tokens=256,
             ),
         )
         raw = response.text.strip()
@@ -222,20 +218,27 @@ Regras:
         """Faz parsing do JSON retornado pelo Gemini com fallback seguro."""
         import re
 
-        # Remove blocos de markdown e espaços extras
         clean = raw.replace("```json", "").replace("```", "").strip()
 
-        # Tenta parsear diretamente
         data = None
         try:
             data = json.loads(clean)
         except (json.JSONDecodeError, ValueError):
-            # Fallback: extrai qualquer objeto JSON do texto via regex
+            # Fallback 1: regex
             match = re.search(r'\{[^{}]*"recommended_strategy"[^{}]*\}', clean, re.DOTALL)
             if match:
                 try:
                     data = json.loads(match.group())
                 except (json.JSONDecodeError, ValueError):
+                    pass
+            
+            # Fallback 2: Tenta extrair primeiro/último {}
+            if not data:
+                try:
+                    start = clean.index("{")
+                    end = clean.rindex("}") + 1
+                    data = json.loads(clean[start:end])
+                except (ValueError, json.JSONDecodeError):
                     pass
 
         if data:
@@ -250,15 +253,27 @@ Regras:
                 raw_response=raw,
             )
 
+        # Fallback 3: Texto livre
+        text_lower = raw.lower()
+        if 'sell' in text_lower or 'bear' in text_lower or 'down' in text_lower:
+            action = 'SELL'
+        elif 'buy' in text_lower or 'bull' in text_lower or 'up' in text_lower:
+            action = 'BUY'
+        else:
+            action = 'NEUTRAL'
+            
+        strategy = available[0] if available else action
+            
         logger.warning(
-            "GeminiAdvisor: falha no parsing da resposta, usando defaults.",
+            "GeminiAdvisor: falha no parsing JSON da resposta, usando heurística de texto livre.",
+            action=action,
             raw_preview=raw[:200],
         )
         return GeminiAdvice(
-            recommended_strategy=available[0] if available else "",
+            recommended_strategy=strategy,
             confidence_multiplier=1.0,
             risk_flag=False,
-            reasoning="Resposta inválida — usando defaults.",
+            reasoning=raw[:200],
             raw_response=raw,
         )
 
